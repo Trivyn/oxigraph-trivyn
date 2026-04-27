@@ -26,6 +26,26 @@ pub trait TokenRecognizer {
 pub enum TokenOrLineJump<T> {
     Token(T),
     LineJump,
+    /// A run of horizontal whitespace (spaces, tabs). Only emitted when the lexer is
+    /// configured with `emit_trivia = true`. Consumers can recover the original bytes
+    /// via [`Lexer::last_token_source`].
+    Whitespace,
+    /// A line comment including any trailing newline. Only emitted when the lexer is
+    /// configured with `emit_trivia = true`. Consumers can recover the original bytes
+    /// (including the leading `#`) via [`Lexer::last_token_source`].
+    Comment,
+}
+
+/// Outcome of consuming one piece of trivia in the lexer.
+enum Skipped {
+    /// No trivia was consumed; proceed to recognize the next token.
+    Nothing,
+    /// A run of horizontal whitespace was consumed.
+    Whitespace,
+    /// A single line ending was consumed.
+    LineJump,
+    /// A single line comment (including its trailing newline, if any) was consumed.
+    Comment,
 }
 
 pub struct TokenRecognizerError {
@@ -63,6 +83,11 @@ pub struct Lexer<B, R: TokenRecognizer> {
     min_buffer_size: usize,
     max_buffer_size: usize,
     line_comment_start: Option<&'static [u8]>,
+    /// When true, the lexer surfaces whitespace runs and comments as
+    /// [`TokenOrLineJump::Whitespace`] / [`TokenOrLineJump::Comment`] events instead of
+    /// silently consuming them. The default is `false`, preserving the zero-overhead
+    /// semantic-only path used by [`crate::TurtleParser`] and friends.
+    emit_trivia: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +106,26 @@ impl<B, R: TokenRecognizer> Lexer<B, R> {
         min_buffer_size: usize,
         max_buffer_size: usize,
         line_comment_start: Option<&'static [u8]>,
+    ) -> Self {
+        Self::new_with_trivia(
+            parser,
+            data,
+            is_ending,
+            min_buffer_size,
+            max_buffer_size,
+            line_comment_start,
+            false,
+        )
+    }
+
+    pub fn new_with_trivia(
+        parser: R,
+        data: B,
+        is_ending: bool,
+        min_buffer_size: usize,
+        max_buffer_size: usize,
+        line_comment_start: Option<&'static [u8]>,
+        emit_trivia: bool,
     ) -> Self {
         Self {
             parser,
@@ -101,6 +146,7 @@ impl<B, R: TokenRecognizer> Lexer<B, R> {
             min_buffer_size,
             max_buffer_size,
             line_comment_start,
+            emit_trivia,
         }
     }
 }
@@ -195,9 +241,40 @@ impl<B: Deref<Target = [u8]>, R: TokenRecognizer> Lexer<B, R> {
         &mut self,
         options: &R::Options,
     ) -> Option<Result<TokenOrLineJump<R::Token<'_>>, TurtleSyntaxError>> {
-        if self.skip_whitespaces_and_comments()? {
-            self.previous_position = self.position;
-            return Some(Ok(TokenOrLineJump::LineJump));
+        loop {
+            let start = self.position;
+            match self.skip_one_trivia()? {
+                Skipped::Nothing => break,
+                Skipped::Whitespace => {
+                    if self.emit_trivia {
+                        self.previous_position = start;
+                        return Some(Ok(TokenOrLineJump::Whitespace));
+                    }
+                    // Otherwise, drop the whitespace and continue accumulating.
+                }
+                Skipped::LineJump => {
+                    // Preserve historical previous_position semantics in non-trivia mode
+                    // so existing error-location output is bit-identical.
+                    self.previous_position = if self.emit_trivia {
+                        start
+                    } else {
+                        self.position
+                    };
+                    return Some(Ok(TokenOrLineJump::LineJump));
+                }
+                Skipped::Comment => {
+                    self.previous_position = if self.emit_trivia {
+                        start
+                    } else {
+                        self.position
+                    };
+                    return Some(Ok(if self.emit_trivia {
+                        TokenOrLineJump::Comment
+                    } else {
+                        TokenOrLineJump::LineJump
+                    }));
+                }
+            }
         }
         self.previous_position = self.position;
         let Some((consumed, result)) = self.parser.recognize_next_token(
@@ -319,15 +396,65 @@ impl<B: Deref<Target = [u8]>, R: TokenRecognizer> Lexer<B, R> {
         self.is_ending && self.data.len() == self.position.buffer_offset
     }
 
-    fn skip_whitespaces_and_comments(&mut self) -> Option<bool> {
-        if self.skip_whitespaces()? {
-            return Some(true);
+    /// Try to consume one piece of trivia (whitespace, line ending, or comment).
+    ///
+    /// Returns `None` if more bytes are needed before a decision can be made.
+    /// Returns `Some(Skipped::Nothing)` when the next byte is real token content.
+    /// Otherwise returns the variant matching what was consumed; the caller is
+    /// responsible for emitting an event or looping to consume the next piece.
+    fn skip_one_trivia(&mut self) -> Option<Skipped> {
+        // 1. A run of horizontal whitespace.
+        let start_offset = self.position.buffer_offset;
+        let mut i = start_offset;
+        while let Some(c) = self.data.get(i) {
+            if *c == b' ' || *c == b'\t' {
+                i += 1;
+            } else {
+                break;
+            }
+            // TODO: SIMD
         }
-
+        if i > start_offset {
+            let consumed = i - start_offset;
+            self.position.buffer_offset = i;
+            self.position.global_offset += u64::try_from(consumed).unwrap();
+            return Some(Skipped::Whitespace);
+        }
+        // We've not made progress yet, so a None data byte means we're either at EOF or
+        // need more data.
+        if self.position.buffer_offset >= self.data.len() {
+            return self.is_ending.then_some(Skipped::Nothing);
+        }
+        // 2. A line ending.
+        match self.data[self.position.buffer_offset] {
+            b'\r' => {
+                let mut increment: usize = 1;
+                if let Some(c) = self.data.get(self.position.buffer_offset + 1) {
+                    if *c == b'\n' {
+                        increment += 1;
+                    }
+                } else if !self.is_ending {
+                    return None; // We need to read more to check for \r\n
+                }
+                self.position.buffer_offset += increment;
+                self.position.line_start_buffer_offset = self.position.buffer_offset;
+                self.position.global_offset += u64::try_from(increment).unwrap();
+                self.position.global_line += 1;
+                return Some(Skipped::LineJump);
+            }
+            b'\n' => {
+                self.position.buffer_offset += 1;
+                self.position.line_start_buffer_offset = self.position.buffer_offset;
+                self.position.global_offset += 1;
+                self.position.global_line += 1;
+                return Some(Skipped::LineJump);
+            }
+            _ => {}
+        }
+        // 3. A comment (if the format defines one).
         let buf = &self.data[self.position.buffer_offset..];
         if let Some(line_comment_start) = self.line_comment_start {
             if buf.starts_with(line_comment_start) {
-                // Comment
                 if let Some(end) = memchr2(b'\r', b'\n', &buf[line_comment_start.len()..]) {
                     let mut end_position = line_comment_start.len() + end;
                     if buf.get(end_position).copied() == Some(b'\r') {
@@ -345,57 +472,27 @@ impl<B: Deref<Target = [u8]>, R: TokenRecognizer> Lexer<B, R> {
                     self.position.line_start_buffer_offset = self.position.buffer_offset;
                     self.position.global_offset += u64::try_from(comment_size).unwrap();
                     self.position.global_line += 1;
-                    return Some(true);
+                    return Some(Skipped::Comment);
                 }
                 if self.is_ending {
-                    self.position.buffer_offset = self.data.len(); // EOF
-                    return Some(false);
+                    // Trailing partial comment with no newline: in trivia mode emit it
+                    // as a Comment; otherwise preserve the historical "consume silently"
+                    // behaviour by reporting Nothing after advancing past it.
+                    let size = self.data.len() - self.position.buffer_offset;
+                    self.position.buffer_offset = self.data.len();
+                    self.position.global_offset += u64::try_from(size).unwrap();
+                    return Some(if self.emit_trivia {
+                        Skipped::Comment
+                    } else {
+                        Skipped::Nothing
+                    });
                 }
                 return None; // We need more data
             } else if !self.is_ending && buf.len() < line_comment_start.len() {
-                return None; // We need more data
+                return None; // We need more data to know whether this is a comment
             }
         }
-        Some(false)
-    }
-
-    fn skip_whitespaces(&mut self) -> Option<bool> {
-        let mut i = self.position.buffer_offset;
-        while let Some(c) = self.data.get(i) {
-            match c {
-                b' ' | b'\t' => {
-                    self.position.buffer_offset += 1;
-                    self.position.global_offset += 1;
-                }
-                b'\r' => {
-                    // We look for \n for Windows line end style
-                    let mut increment: u8 = 1;
-                    if let Some(c) = self.data.get(i + 1) {
-                        if *c == b'\n' {
-                            increment += 1;
-                        }
-                    } else if !self.is_ending {
-                        return None; // We need to read more
-                    }
-                    self.position.buffer_offset += usize::from(increment);
-                    self.position.line_start_buffer_offset = self.position.buffer_offset;
-                    self.position.global_offset += u64::from(increment);
-                    self.position.global_line += 1;
-                    return Some(true);
-                }
-                b'\n' => {
-                    self.position.buffer_offset += 1;
-                    self.position.line_start_buffer_offset = self.position.buffer_offset;
-                    self.position.global_offset += 1;
-                    self.position.global_line += 1;
-                    return Some(true);
-                }
-                _ => return Some(false),
-            }
-            i += 1;
-            // TODO: SIMD
-        }
-        self.is_ending.then_some(false) // We return None if there is not enough data
+        Some(Skipped::Nothing)
     }
 
     fn find_number_of_line_jumps_and_start_of_last_line(bytes: &[u8]) -> (u64, usize) {
