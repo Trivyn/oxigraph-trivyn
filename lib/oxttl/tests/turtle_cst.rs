@@ -175,3 +175,67 @@ fn remove_class_removes_subject_section_only() {
     // Object-position references to Dog (none here, but check Mammal still subclasses Animal).
     assert!(out.contains("ex:Mammal a owl:Class ;\n    rdfs:subClassOf ex:Animal"));
 }
+
+/// Regression: `add_predicate_object` on a statement whose `pog` is empty
+/// must produce a leading POG with no `;` separator. Previously emitted
+/// `subject ; predicate object .` (invalid Turtle) because the separator
+/// was unconditionally `Some(";")`.
+#[test]
+fn add_predicate_object_to_empty_pog_omits_leading_separator() {
+    let input = "@prefix ex: <http://example.com/> .\n\n\
+                 ex:A a ex:Class .\n";
+    let mut cst = TurtleCstParser::new()
+        .parse_slice(input.as_bytes())
+        .expect("parse");
+    let subj = NamedNode::new_unchecked("http://example.com/A");
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let class = Term::from(NamedNode::new_unchecked("http://example.com/Class"));
+    let pred = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+    let parent = Term::from(NamedNode::new_unchecked("http://example.com/B"));
+
+    for s in cst.statements_for_subject(&subj) {
+        // Drain to empty, then add. New POG must become first with no `;`.
+        s.remove_predicate_object(&rdf_type, &class);
+        s.add_predicate_object(pred.clone(), &parent);
+    }
+    let out = cst.to_string();
+    assert!(
+        !out.contains("ex:A ;") && !out.contains("ex:A;"),
+        "no stray ';' immediately after subject:\n{out}"
+    );
+    // And the result must re-parse cleanly via the regular Turtle parser.
+    use oxttl::TurtleParser;
+    for r in TurtleParser::new().for_slice(out.as_bytes()) {
+        r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
+    }
+}
+
+/// Regression: `remove_predicate_object` that drops the original first POG
+/// must clear the leading `;` of the new first POG (which was previously a
+/// non-first POG and therefore had `Some(";")`).
+#[test]
+fn remove_first_pog_clears_separator_on_promoted_pog() {
+    let input = "@prefix ex: <http://example.com/> .\n\n\
+                 ex:A a ex:Class ;\n    ex:p ex:o .\n";
+    let mut cst = TurtleCstParser::new()
+        .parse_slice(input.as_bytes())
+        .expect("parse");
+    let subj = NamedNode::new_unchecked("http://example.com/A");
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let class = Term::from(NamedNode::new_unchecked("http://example.com/Class"));
+
+    for s in cst.statements_for_subject(&subj) {
+        // Drop `a ex:Class` (the first POG); `ex:p ex:o` now becomes first
+        // and must lose its leading `;`.
+        s.remove_predicate_object(&rdf_type, &class);
+    }
+    let out = cst.to_string();
+    assert!(
+        !out.contains("ex:A ;") && !out.contains("ex:A;"),
+        "promoted POG must not carry leading ';':\n{out}"
+    );
+    use oxttl::TurtleParser;
+    for r in TurtleParser::new().for_slice(out.as_bytes()) {
+        r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
+    }
+}

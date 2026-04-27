@@ -2244,15 +2244,24 @@ impl Statement {
 
     /// Append a new predicate-object pair as a new POG, preserving indentation
     /// of the previous group when possible.
+    ///
+    /// Maintains the invariant that the first POG of a statement has
+    /// `separator: None` and any subsequent POG has `Some(";")`. If the
+    /// statement currently has no POGs, the new one becomes the first and is
+    /// emitted without a leading `;`; otherwise it gets a `;` separator.
     pub fn add_predicate_object(&mut self, predicate: NamedNode, object: &Term) {
-        let separator = SourceText::new(";");
+        let separator = if self.pog.is_empty() {
+            None
+        } else {
+            Some(SourceText::new(";"))
+        };
         let leading_predicate_trivia = self.pog.last().map_or_else(
             || vec![Trivia::Whitespace(" ".to_owned())],
             |prev| prev.leading_predicate_trivia.clone(),
         );
         let new_group = PredicateObjectGroup {
             leading_trivia: Vec::new(),
-            separator: Some(separator),
+            separator,
             leading_predicate_trivia,
             predicate: PredicateNode::Iri(IriNode {
                 source: String::new(),
@@ -2277,6 +2286,10 @@ impl Statement {
 
     /// Remove the matched `(predicate, object)` pair. Returns true if any pair
     /// was removed.
+    ///
+    /// If removal demotes a previously non-first POG into the first position,
+    /// its leading `;` separator is cleared so the serialized output remains
+    /// valid Turtle (`subject pred obj .`, not `subject ; pred obj .`).
     pub fn remove_predicate_object(&mut self, predicate: &NamedNode, object: &Term) -> bool {
         let mut removed = false;
         let mut new_pog: Vec<PredicateObjectGroup> = Vec::new();
@@ -2298,6 +2311,9 @@ impl Statement {
             }
         }
         self.pog = new_pog;
+        if let Some(first) = self.pog.first_mut() {
+            first.separator = None;
+        }
         removed
     }
 }
