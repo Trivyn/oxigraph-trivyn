@@ -404,7 +404,10 @@ impl NQuadsRecognizer {
         let this = self.error_recovery_state();
         match token {
             TokenOrLineJump::Token(_) => this,
-            TokenOrLineJump::LineJump => this.recognize_next(token, context, results, errors), /* We immediately recover */
+            TokenOrLineJump::LineJump | TokenOrLineJump::Whitespace | TokenOrLineJump::Comment => {
+                // We immediately recover.
+                this.recognize_next(token, context, results, errors)
+            }
         }
     }
 
