@@ -210,6 +210,40 @@ fn add_predicate_object_to_empty_pog_omits_leading_separator() {
     }
 }
 
+/// Regression: `add_predicate_object` on a multi-line statement must inherit
+/// the statement's existing indent (newline + leading spaces) so the new POG
+/// lands on its own line. Previously the implementation cloned
+/// `leading_predicate_trivia` from the previous POG, but the parser stashes
+/// inter-POG whitespace in `leading_trivia` (between `;` and the next
+/// predicate); `leading_predicate_trivia` is drained empty. The bug surfaced
+/// as `vs:term_status "x" ;rdfs:comment "y"` with no whitespace after `;`.
+#[test]
+fn add_predicate_object_preserves_multi_line_indent() {
+    let input = "@prefix ex: <http://example.com/> .\n\n\
+                 ex:Foo\n      a ex:Class ;\n      ex:p1 \"x\" .\n";
+    let mut cst = TurtleCstParser::new()
+        .parse_slice(input.as_bytes())
+        .expect("parse");
+    let subj = NamedNode::new_unchecked("http://example.com/Foo");
+    let new_pred = NamedNode::new_unchecked("http://example.com/p2");
+    let new_obj = Term::from(Literal::new_simple_literal("y"));
+
+    for s in cst.statements_for_subject(&subj) {
+        s.add_predicate_object(new_pred.clone(), &new_obj);
+    }
+    let out = cst.to_string();
+    // The new POG must land on its own line with the same 6-space indent.
+    assert!(
+        out.contains(";\n      ex:p2"),
+        "added POG must inherit the statement's indent (`;\\n      ex:p2`):\n{out}"
+    );
+    // Previous POGs must still parse cleanly via the regular parser.
+    use oxttl::TurtleParser;
+    for r in TurtleParser::new().for_slice(out.as_bytes()) {
+        r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
+    }
+}
+
 /// Regression: `remove_predicate_object` that drops the original first POG
 /// must clear the leading `;` of the new first POG (which was previously a
 /// non-first POG and therefore had `Some(";")`).
