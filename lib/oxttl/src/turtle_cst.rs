@@ -2242,27 +2242,37 @@ impl Statement {
         found
     }
 
-    /// Append a new predicate-object pair as a new POG, preserving indentation
-    /// of the previous group when possible.
+    /// Append a new predicate-object pair as a new POG, preserving the
+    /// statement's existing layout (indent, newline-style) by inheriting the
+    /// previous POG's `leading_trivia`.
     ///
-    /// Maintains the invariant that the first POG of a statement has
-    /// `separator: None` and any subsequent POG has `Some(";")`. If the
-    /// statement currently has no POGs, the new one becomes the first and is
-    /// emitted without a leading `;`; otherwise it gets a `;` separator.
+    /// **Layout note.** Inter-POG whitespace (the `\n      ` between a `;`
+    /// separator and the next predicate) is parsed into the *following*
+    /// POG's `leading_trivia` field, not `leading_predicate_trivia` — the
+    /// latter is drained empty by the time `parse_predicate_object_group`
+    /// runs. Cloning the wrong field would produce output like
+    /// `... ;next_pred` with no indent. This implementation clones
+    /// `leading_trivia` so a multi-line statement stays multi-line and a
+    /// single-line statement stays single-line.
+    ///
+    /// **Separator invariant.** First POG of a statement has
+    /// `separator: None`; subsequent POGs have `Some(";")`. If the statement
+    /// currently has no POGs, the new one becomes the first and is emitted
+    /// without a leading `;`; otherwise it gets a `;` separator.
     pub fn add_predicate_object(&mut self, predicate: NamedNode, object: &Term) {
         let separator = if self.pog.is_empty() {
             None
         } else {
             Some(SourceText::new(";"))
         };
-        let leading_predicate_trivia = self.pog.last().map_or_else(
+        let leading_trivia = self.pog.last().map_or_else(
             || vec![Trivia::Whitespace(" ".to_owned())],
-            |prev| prev.leading_predicate_trivia.clone(),
+            |prev| prev.leading_trivia.clone(),
         );
         let new_group = PredicateObjectGroup {
-            leading_trivia: Vec::new(),
+            leading_trivia,
             separator,
-            leading_predicate_trivia,
+            leading_predicate_trivia: Vec::new(),
             predicate: PredicateNode::Iri(IriNode {
                 source: String::new(),
                 value: predicate,
