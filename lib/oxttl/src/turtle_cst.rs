@@ -71,7 +71,7 @@ impl TurtleCstParser {
 
     /// Parse a slice of bytes into a [`TurtleCst`].
     pub fn parse_slice(self, input: &[u8]) -> Result<TurtleCst, TurtleSyntaxError> {
-        let events = lex_to_events(input, self.lenient)?;
+        let events = lex_to_events(input, self.lenient, self.base_iri.as_ref())?;
         let mut cursor = EventCursor::new(events);
         let mut prefixes = HashMap::new();
         let mut base = self.base_iri.clone();
@@ -415,7 +415,11 @@ enum OwnedTokenKind {
     Keyword(String),
 }
 
-fn lex_to_events(input: &[u8], lenient: bool) -> Result<Vec<RawEvent>, TurtleSyntaxError> {
+fn lex_to_events(
+    input: &[u8],
+    lenient: bool,
+    base_iri: Option<&Iri<String>>,
+) -> Result<Vec<RawEvent>, TurtleSyntaxError> {
     let mut lexer = Lexer::new_with_trivia(
         N3Lexer::new(N3LexerMode::Turtle, lenient),
         input,
@@ -425,7 +429,13 @@ fn lex_to_events(input: &[u8], lenient: bool) -> Result<Vec<RawEvent>, TurtleSyn
         Some(b"#"),
         true, // emit_trivia
     );
-    let options = N3LexerOptions::default();
+    // Forward the parser's base IRI so relative IRI references (`<>`, `<#frag>`,
+    // `<rel>`) resolve during lexing. Without this the lexer runs with no base
+    // and, in strict mode, rejects every relative IRI ("No scheme found in an
+    // absolute IRI") before the parser's own resolution can run.
+    let options = N3LexerOptions {
+        base_iri: base_iri.cloned(),
+    };
     let mut events = Vec::new();
     enum Tag {
         Token(OwnedTokenKind),
@@ -2542,6 +2552,39 @@ mod tests {
     #[test]
     fn rt_prefix_then_statement() {
         roundtrip("@prefix ex: <http://example.com/> .\nex:Foo a ex:Class .\n");
+    }
+
+    #[test]
+    fn strict_parse_resolves_relative_iris_against_supplied_base() {
+        // Regression: with a base supplied via `with_base_iri`, relative IRI
+        // references must parse in STRICT mode (they were rejected at lex time
+        // when the base was not forwarded to the lexer) and round-trip verbatim.
+        let input = "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                     <> a owl:Ontology .\n\
+                     <#Person> a owl:Class .\n\
+                     <widget> a owl:Class .\n";
+        let cst = TurtleCstParser::new()
+            .with_base_iri("http://example.org/onto")
+            .unwrap()
+            .parse_slice(input.as_bytes())
+            .unwrap_or_else(|e| panic!("strict parse of relative IRIs failed: {e}"));
+        // Text is preserved exactly …
+        assert_eq!(cst.to_string(), input);
+        // … while the relative references resolve to absolute IRIs.
+        let subjects: Vec<String> = cst
+            .items()
+            .iter()
+            .filter_map(|it| match it {
+                DocItem::Statement(s) => match &s.subject {
+                    SubjectNode::Iri(i) => Some(i.value.as_str().to_owned()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(subjects.contains(&"http://example.org/onto".to_owned()));
+        assert!(subjects.contains(&"http://example.org/onto#Person".to_owned()));
+        assert!(subjects.contains(&"http://example.org/widget".to_owned()));
     }
 
     #[test]
