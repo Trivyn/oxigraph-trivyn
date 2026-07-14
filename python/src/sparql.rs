@@ -9,8 +9,8 @@ use oxigraph::sparql::results::{
 };
 use oxigraph::sparql::{
     AggregateFunctionAccumulator, PreparedSparqlQuery, QueryEvaluationError, QueryResults,
-    QuerySolution, QuerySolutionIter, QueryTripleIter, SparqlEvaluator, UpdateEvaluationError,
-    Variable,
+    QuerySolution, QuerySolutionIter, QueryTripleIter, SparqlEvaluator, SparqlSyntaxError,
+    UpdateEvaluationError, Variable,
 };
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PySyntaxError, PyValueError};
@@ -20,9 +20,9 @@ use pyo3::types::PyTuple;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::vec::IntoIter;
+use std::{fmt, io};
 
 pub fn prepare_sparql_query(
     evaluator: SparqlEvaluator,
@@ -33,7 +33,7 @@ pub fn prepare_sparql_query(
 ) -> PyResult<PreparedSparqlQuery> {
     let mut prepared = evaluator
         .parse_query(query)
-        .map_err(|e| PySyntaxError::new_err(e.to_string()))?;
+        .map_err(map_sparql_syntax_error)?;
 
     if use_default_graph_as_union && default_graph.is_some() {
         return Err(PyValueError::new_err(
@@ -294,7 +294,7 @@ pub struct PyQuerySolutions {
     inner: PyQuerySolutionsVariant,
 }
 
-#[allow(clippy::large_enum_variant, clippy::allow_attributes)]
+#[expect(clippy::large_enum_variant)]
 enum PyQuerySolutionsVariant {
     Query(UngilQuerySolutionIter),
     Reader {
@@ -633,6 +633,7 @@ pub fn parse_query_results(
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -740,10 +741,6 @@ impl PyQueryResultsFormat {
         })
     }
 
-    fn __str__(&self) -> &'static str {
-        self.inner.name()
-    }
-
     fn __repr__(&self) -> String {
         format!("<QueryResultsFormat {}>", self.inner.name())
     }
@@ -758,6 +755,12 @@ impl PyQueryResultsFormat {
     #[expect(unused_variables)]
     fn __deepcopy__<'a>(slf: PyRef<'a, Self>, memo: &'_ Bound<'_, PyAny>) -> PyRef<'a, Self> {
         slf
+    }
+}
+
+impl fmt::Display for PyQueryResultsFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
     }
 }
 
@@ -824,6 +827,31 @@ pub fn map_update_evaluation_error(error: UpdateEvaluationError) -> PyErr {
             },
         },
         _ => PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+#[expect(clippy::needless_pass_by_value)]
+pub fn map_sparql_syntax_error(error: SparqlSyntaxError) -> PyErr {
+    let location = error.location();
+    // Python 3.9 does not support end line and end column
+    if python_version() >= (3, 10) {
+        let params = (
+            None::<PathBuf>,
+            Some(location.start.line + 1),
+            Some(location.start.column + 1),
+            None::<Vec<u8>>,
+            Some(location.end.line + 1),
+            Some(location.end.column + 1),
+        );
+        PySyntaxError::new_err((error.to_string(), params))
+    } else {
+        let params = (
+            None::<PathBuf>,
+            Some(location.start.line + 1),
+            Some(location.start.column + 1),
+            None::<Vec<u8>>,
+        );
+        PySyntaxError::new_err((error.to_string(), params))
     }
 }
 

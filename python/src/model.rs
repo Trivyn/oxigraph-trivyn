@@ -1,11 +1,12 @@
-#![allow(clippy::multiple_inherent_impl)]
+#![expect(clippy::multiple_inherent_impl)]
 
 use oxigraph::model::vocab::{rdf, xsd};
 use oxigraph::model::*;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyIndexError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyUnicodeDecodeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyTuple};
+use pyo3::types::{PyDict, PyInt, PyString, PyTuple};
+use std::fmt;
 use std::vec::IntoIter;
 
 /// An RDF `node identified by an IRI <https://www.w3.org/TR/rdf11-concepts/#dfn-iri>`_.
@@ -25,6 +26,7 @@ use std::vec::IntoIter;
     eq,
     ord,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone, Hash)]
@@ -65,7 +67,7 @@ impl From<PyNamedNode> for GraphName {
 #[pymethods]
 impl PyNamedNode {
     #[new]
-    fn new(value: String) -> PyResult<Self> {
+    fn new(value: OxStringInput) -> PyResult<Self> {
         Ok(NamedNode::new(value)
             .map_err(|e| PyValueError::new_err(e.to_string()))?
             .into())
@@ -79,10 +81,6 @@ impl PyNamedNode {
     #[getter]
     fn value(&self) -> &str {
         self.inner.as_str()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
     }
 
     fn __repr__(&self) -> String {
@@ -114,6 +112,12 @@ impl PyNamedNode {
     }
 }
 
+impl fmt::Display for PyNamedNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// An RDF `blank node <https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node>`_.
 ///
 /// :param value: the `blank node identifier <https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node-identifier>`_ (if not present, a random blank node identifier is automatically generated).
@@ -130,6 +134,7 @@ impl PyNamedNode {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -171,7 +176,7 @@ impl From<PyBlankNode> for GraphName {
 impl PyBlankNode {
     #[new]
     #[pyo3(signature = (value = None))]
-    fn new(value: Option<String>) -> PyResult<Self> {
+    fn new(value: Option<OxStringInput>) -> PyResult<Self> {
         Ok(if let Some(value) = value {
             BlankNode::new(value).map_err(|e| PyValueError::new_err(e.to_string()))?
         } else {
@@ -188,10 +193,6 @@ impl PyBlankNode {
     #[getter]
     fn value(&self) -> &str {
         self.inner.as_str()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
     }
 
     fn __repr__(&self) -> String {
@@ -223,6 +224,12 @@ impl PyBlankNode {
     }
 }
 
+impl fmt::Display for PyBlankNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// An RDF `literal <https://www.w3.org/TR/rdf11-concepts/#dfn-literal>`_.
 ///
 /// :param value: the literal value or `lexical form <https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form>`_.
@@ -251,6 +258,7 @@ impl PyBlankNode {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -279,9 +287,9 @@ impl From<PyLiteral> for Term {
 impl PyLiteral {
     fn from_value(value: &Bound<'_, PyAny>, datatype: Option<PyNamedNode>) -> PyResult<Self> {
         Ok(if let Some(datatype) = datatype {
-            Literal::new_typed_literal(value.extract::<String>()?, datatype)
-        } else if let Ok(value) = value.extract::<String>() {
-            value.into()
+            Literal::new_typed_literal(value.extract::<OxStringInput>()?, datatype)
+        } else if let Ok(value) = value.extract::<OxStringInput>() {
+            Literal::new_simple_literal(value)
         } else if let Ok(value) = value.extract::<bool>() {
             value.into()
         } else if let Ok(value) = value.extract::<Bound<'_, PyInt>>() {
@@ -305,7 +313,7 @@ impl PyLiteral {
     fn new(
         value: &Bound<'_, PyAny>,
         datatype: Option<PyNamedNode>,
-        language: Option<String>,
+        language: Option<OxStringInput>,
         direction: Option<PyBaseDirection>,
     ) -> PyResult<Self> {
         if let Some(language) = language {
@@ -318,7 +326,7 @@ impl PyLiteral {
                     }
                 }
                 return Ok(Literal::new_directional_language_tagged_literal(
-                    value.extract::<String>()?,
+                    value.extract::<OxStringInput>()?,
                     language,
                     direction,
                 )
@@ -332,11 +340,12 @@ impl PyLiteral {
                     ));
                 }
             }
-            return Ok(
-                Literal::new_language_tagged_literal(value.extract::<String>()?, language)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?
-                    .into(),
-            );
+            return Ok(Literal::new_language_tagged_literal(
+                value.extract::<OxStringInput>()?,
+                language,
+            )
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .into());
         }
         if direction.is_some() {
             return Err(PyValueError::new_err(
@@ -352,7 +361,7 @@ impl PyLiteral {
     fn new(
         value: &Bound<'_, PyAny>,
         datatype: Option<PyNamedNode>,
-        language: Option<String>,
+        language: Option<OxStringInput>,
     ) -> PyResult<Self> {
         if let Some(language) = language {
             if let Some(datatype) = datatype {
@@ -363,7 +372,7 @@ impl PyLiteral {
                 }
             }
             Ok(
-                Literal::new_language_tagged_literal(value.extract::<String>()?, language)
+                Literal::new_language_tagged_literal(value.extract::<OxStringInput>()?, language)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?
                     .into(),
             )
@@ -416,11 +425,7 @@ impl PyLiteral {
     /// <NamedNode value=http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>
     #[getter]
     fn datatype(&self) -> PyNamedNode {
-        self.inner.datatype().into_owned().into()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
+        self.inner.datatype().clone().into()
     }
 
     fn __repr__(&self) -> String {
@@ -441,11 +446,8 @@ impl PyLiteral {
             if let Some(direction) = self.inner.direction() {
                 kwargs.set_item("direction", PyBaseDirection::from(direction))?;
             }
-        } else if self.inner.datatype() != xsd::STRING {
-            kwargs.set_item(
-                "datatype",
-                PyNamedNode::from(self.inner.datatype().into_owned()),
-            )?;
+        } else if *self.inner.datatype() != xsd::STRING {
+            kwargs.set_item("datatype", PyNamedNode::from(self.inner.datatype().clone()))?;
         }
         Ok(((self.value(),), kwargs))
     }
@@ -468,6 +470,12 @@ impl PyLiteral {
     }
 }
 
+impl fmt::Display for PyLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// A `directional language-tagged string <https://www.w3.org/TR/rdf12-concepts/#dfn-dir-lang-string>`_ `base-direction <https://www.w3.org/TR/rdf12-concepts/#dfn-base-direction>`_
 ///
 /// :param value: the direction as a string (`ltr` or `rtl`).
@@ -484,6 +492,7 @@ impl PyLiteral {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Copy, Hash)]
@@ -549,10 +558,6 @@ impl PyBaseDirection {
         }
     }
 
-    fn __str__(&self) -> &'static str {
-        self.value()
-    }
-
     fn __repr__(&self) -> &'static str {
         match self.inner {
             BaseDirection::Ltr => "<LtrBaseDirection>",
@@ -583,6 +588,13 @@ impl PyBaseDirection {
     }
 }
 
+#[cfg(feature = "rdf-12")]
+impl fmt::Display for PyBaseDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// The RDF `default graph name <https://www.w3.org/TR/rdf11-concepts/#dfn-default-graph>`_.
 #[pyclass(
     frozen,
@@ -590,6 +602,7 @@ impl PyBaseDirection {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Copy, Hash)]
@@ -606,10 +619,6 @@ impl PyDefaultGraph {
     #[new]
     fn new() -> Self {
         Self {}
-    }
-
-    fn __str__(&self) -> &'static str {
-        "DEFAULT"
     }
 
     fn __repr__(&self) -> &'static str {
@@ -631,6 +640,12 @@ impl PyDefaultGraph {
     #[expect(unused_variables)]
     fn __deepcopy__<'a>(slf: PyRef<'a, Self>, memo: &'_ Bound<'_, PyAny>) -> PyRef<'a, Self> {
         slf
+    }
+}
+
+impl fmt::Display for PyDefaultGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DEFAULT")
     }
 }
 
@@ -715,6 +730,7 @@ impl From<Term> for PyTerm {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -731,12 +747,6 @@ impl From<Triple> for PyTriple {
 impl From<PyTriple> for Triple {
     fn from(triple: PyTriple) -> Self {
         triple.inner
-    }
-}
-
-impl<'a> From<&'a PyTriple> for TripleRef<'a> {
-    fn from(triple: &'a PyTriple) -> Self {
-        triple.inner.as_ref()
     }
 }
 
@@ -782,10 +792,6 @@ impl PyTriple {
     #[getter]
     fn object(&self) -> PyTerm {
         self.inner.object.clone().into()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
     }
 
     fn __repr__(&self) -> String {
@@ -838,6 +844,18 @@ impl PyTriple {
     #[classattr]
     fn __match_args__() -> (&'static str, &'static str, &'static str) {
         ("subject", "predicate", "object")
+    }
+}
+
+impl fmt::Display for PyTriple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl AsRef<Triple> for PyTriple {
+    fn as_ref(&self) -> &Triple {
+        &self.inner
     }
 }
 
@@ -898,6 +916,7 @@ impl From<GraphName> for PyGraphName {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -917,9 +936,9 @@ impl From<PyQuad> for Quad {
     }
 }
 
-impl<'a> From<&'a PyQuad> for QuadRef<'a> {
-    fn from(node: &'a PyQuad) -> Self {
-        node.inner.as_ref()
+impl AsRef<Quad> for PyQuad {
+    fn as_ref(&self) -> &Quad {
+        &self.inner
     }
 }
 
@@ -990,10 +1009,6 @@ impl PyQuad {
     #[getter]
     fn triple(&self) -> PyTriple {
         Triple::from(self.inner.clone()).into()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
     }
 
     fn __repr__(&self) -> String {
@@ -1068,6 +1083,12 @@ impl PyQuad {
     }
 }
 
+impl fmt::Display for PyQuad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// A SPARQL query variable.
 ///
 /// :param value: the variable name as a string.
@@ -1084,6 +1105,7 @@ impl PyQuad {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -1112,7 +1134,7 @@ impl<'a> From<&'a PyVariable> for &'a Variable {
 #[pymethods]
 impl PyVariable {
     #[new]
-    fn new(value: String) -> PyResult<Self> {
+    fn new(value: OxStringInput) -> PyResult<Self> {
         Ok(Variable::new(value)
             .map_err(|e| PyValueError::new_err(e.to_string()))?
             .into())
@@ -1126,10 +1148,6 @@ impl PyVariable {
     #[getter]
     fn value(&self) -> &str {
         self.inner.as_str()
-    }
-
-    fn __str__(&self) -> String {
-        self.inner.to_string()
     }
 
     fn __repr__(&self) -> String {
@@ -1156,6 +1174,12 @@ impl PyVariable {
     #[classattr]
     fn __match_args__() -> (&'static str,) {
         ("value",)
+    }
+}
+
+impl fmt::Display for PyVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
     }
 }
 
@@ -1317,5 +1341,28 @@ impl QuadComponentsIter {
                 PyDefaultGraph {}.into_bound_py_any(py)
             }
         })
+    }
+}
+
+struct OxStringInput(OxString);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for OxStringInput {
+    type Error = PyErr;
+
+    #[inline]
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        // TODO: Use to_str when targeting Python 3.10+
+        let encoded = obj.cast::<PyString>()?.encode_utf8()?;
+        let encoded = encoded.as_bytes();
+        let decoded = str::from_utf8(encoded)
+            .map_err(|e| PyUnicodeDecodeError::new_err_from_utf8(obj.py(), encoded, e))?;
+        Ok(Self(OxString::new_owned(decoded)))
+    }
+}
+
+impl From<OxStringInput> for OxString {
+    #[inline]
+    fn from(value: OxStringInput) -> Self {
+        value.0
     }
 }

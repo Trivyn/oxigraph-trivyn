@@ -1,9 +1,11 @@
 //! Data structures around SPARQL queries. The main type is [`Query`].
 
+use crate::SparqlParser;
 use crate::algebra::*;
-use crate::parser::{SparqlParser, SparqlSyntaxError};
+use crate::error::SparqlSyntaxError;
 use crate::term::*;
 use oxiri::Iri;
+use oxrdf::OxString;
 use std::fmt;
 use std::str::FromStr;
 
@@ -55,7 +57,7 @@ impl Query {
     }
 
     #[inline]
-    pub fn base_iri(&self) -> Option<&Iri<String>> {
+    pub fn base_iri(&self) -> Option<&Iri<OxString>> {
         match self {
             Self::Select(query) => query.base_iri.as_ref(),
             Self::Construct(query) => query.base_iri.as_ref(),
@@ -125,7 +127,7 @@ pub struct SelectQuery {
     /// The query selection graph pattern.
     pub pattern: GraphPattern,
     /// The query base IRI.
-    pub base_iri: Option<Iri<String>>,
+    pub base_iri: Option<Iri<OxString>>,
 }
 
 impl SelectQuery {
@@ -162,11 +164,7 @@ impl fmt::Display for SelectQuery {
         if let Some(base_iri) = &self.base_iri {
             writeln!(f, "BASE <{base_iri}>")?;
         }
-        write!(
-            f,
-            "{}",
-            SparqlGraphRootPattern::new(&self.pattern, self.dataset.as_ref())
-        )
+        SparqlGraphRootPattern::new(&self.pattern, self.dataset.as_ref())?.fmt(f)
     }
 }
 
@@ -187,7 +185,7 @@ pub struct ConstructQuery {
     /// The query selection graph pattern.
     pub pattern: GraphPattern,
     /// The query base IRI.
-    pub base_iri: Option<Iri<String>>,
+    pub base_iri: Option<Iri<OxString>>,
 }
 
 impl ConstructQuery {
@@ -239,13 +237,14 @@ impl fmt::Display for ConstructQuery {
         }
         f.write_str("}")?;
         if let Some(dataset) = &self.dataset {
-            dataset.fmt(f)?;
+            write!(f, " {dataset}")?;
         }
-        write!(
-            f,
-            " WHERE {{ {} }}",
-            SparqlGraphRootPattern::new(&self.pattern, None)
-        )
+        let mut pattern = &self.pattern;
+        // We ignore the root projection, it's useless
+        if let GraphPattern::Project { inner, .. } = pattern {
+            pattern = inner;
+        }
+        write!(f, " WHERE {{ {pattern} }}")
     }
 }
 
@@ -264,7 +263,7 @@ pub struct DescribeQuery {
     /// The query selection graph pattern.
     pub pattern: GraphPattern,
     /// The query base IRI.
-    pub base_iri: Option<Iri<String>>,
+    pub base_iri: Option<Iri<OxString>>,
 }
 
 impl DescribeQuery {
@@ -303,15 +302,48 @@ impl fmt::Display for DescribeQuery {
         if let Some(base_iri) = &self.base_iri {
             writeln!(f, "BASE <{}>", base_iri.as_str())?;
         }
-        f.write_str("DESCRIBE *")?;
+
+        // We find the DESCRIBE IRIs
+        let mut pattern = &self.pattern;
+        let mut iris = Vec::new();
+        while let GraphPattern::Extend {
+            inner,
+            expression: Expression::NamedNode(iri),
+            ..
+        } = pattern
+        {
+            iris.push(iri);
+            pattern = inner;
+        }
+
+        // If there is a projection, we can inline it too
+        let mut select_variables = Vec::new();
+        if let GraphPattern::Project { inner, variables } = pattern {
+            select_variables.extend(variables);
+            pattern = inner;
+        } else {
+            pattern.on_in_scope_variable(|v| {
+                if !select_variables.contains(&v) {
+                    select_variables.push(v);
+                }
+            })
+        }
+
+        f.write_str("DESCRIBE ")?;
+        if select_variables.is_empty() && iris.is_empty() {
+            writeln!(f, " *")?;
+        }
+        for variable in select_variables {
+            write!(f, " {variable}")?;
+        }
+        for iri in iris.iter().rev() {
+            // reverse to keep the same order as the parsing
+            write!(f, " {iri}")?;
+        }
         if let Some(dataset) = &self.dataset {
             dataset.fmt(f)?;
         }
-        write!(
-            f,
-            " WHERE {{ {} }}",
-            SparqlGraphRootPattern::new(&self.pattern, None)
-        )
+        write!(f, " WHERE {{ {pattern} }}")
     }
 }
 
@@ -330,7 +362,7 @@ pub struct AskQuery {
     /// The query selection graph pattern.
     pub pattern: GraphPattern,
     /// The query base IRI.
-    pub base_iri: Option<Iri<String>>,
+    pub base_iri: Option<Iri<OxString>>,
 }
 
 impl AskQuery {
@@ -371,13 +403,14 @@ impl fmt::Display for AskQuery {
         }
         f.write_str("ASK")?;
         if let Some(dataset) = &self.dataset {
-            dataset.fmt(f)?;
+            write!(f, " {dataset}")?;
         }
-        write!(
-            f,
-            " WHERE {{ {} }}",
-            SparqlGraphRootPattern::new(&self.pattern, None)
-        )
+        let mut pattern = &self.pattern;
+        // We ignore the root projection, it's useless
+        if let GraphPattern::Project { inner, .. } = pattern {
+            pattern = inner;
+        }
+        write!(f, " WHERE {{ {pattern} }}")
     }
 }
 

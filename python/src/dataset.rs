@@ -1,8 +1,9 @@
 use crate::model::{PyGraphNameRef, PyNamedNodeRef, PyNamedOrBlankNodeRef, PyQuad, PyTermRef};
+use oxigraph::model::Quad;
 use oxigraph::model::dataset::{CanonicalizationAlgorithm, CanonicalizationHashAlgorithm, Dataset};
-use oxigraph::model::{Quad, QuadRef};
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
+use std::fmt;
 
 /// An in-memory `RDF dataset <https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset>`_.
 ///
@@ -20,7 +21,7 @@ use pyo3::prelude::*;
 ///
 /// >>> str(Dataset([Quad(NamedNode('http://example.com/s'), NamedNode('http://example.com/p'), NamedNode('http://example.com/o'), NamedNode('http://example.com/g'))]))
 /// '<http://example.com/s> <http://example.com/p> <http://example.com/o> <http://example.com/g> .\n'
-#[pyclass(name = "Dataset", module = "pyoxigraph", eq)]
+#[pyclass(name = "Dataset", module = "pyoxigraph", eq, str)]
 #[derive(Eq, PartialEq, Debug)]
 pub struct PyDataset {
     inner: Dataset,
@@ -34,7 +35,7 @@ impl PyDataset {
         let mut inner = Dataset::new();
         if let Some(quads) = quads {
             for quad in quads.try_iter()? {
-                inner.insert(&*quad?.extract::<PyRef<'_, PyQuad>>()?);
+                inner.insert(quad?.extract::<PyQuad>()?);
             }
         }
         Ok(Self { inner })
@@ -56,7 +57,6 @@ impl PyDataset {
             inner: self
                 .inner
                 .quads_for_subject(&subject)
-                .map(QuadRef::into_owned)
                 .collect::<Vec<_>>()
                 .into_iter(),
         }
@@ -78,7 +78,6 @@ impl PyDataset {
             inner: self
                 .inner
                 .quads_for_predicate(&predicate)
-                .map(QuadRef::into_owned)
                 .collect::<Vec<_>>()
                 .into_iter(),
         }
@@ -100,7 +99,6 @@ impl PyDataset {
             inner: self
                 .inner
                 .quads_for_object(&object)
-                .map(QuadRef::into_owned)
                 .collect::<Vec<_>>()
                 .into_iter(),
         }
@@ -122,7 +120,6 @@ impl PyDataset {
             inner: self
                 .inner
                 .quads_for_graph_name(&graph_name)
-                .map(QuadRef::into_owned)
                 .collect::<Vec<_>>()
                 .into_iter(),
         }
@@ -139,7 +136,7 @@ impl PyDataset {
     /// >>> dataset.add(quad)
     /// >>> quad in dataset
     /// True
-    fn add(&mut self, quad: &PyQuad) {
+    fn add(&mut self, quad: PyQuad) {
         self.inner.insert(quad);
     }
 
@@ -156,12 +153,12 @@ impl PyDataset {
     /// >>> quad in dataset
     /// False
     fn remove(&mut self, quad: &PyQuad) -> PyResult<()> {
-        if self.inner.remove(quad) {
+        if self.inner.remove(quad.as_ref()) {
             Ok(())
         } else {
             Err(PyKeyError::new_err(format!(
                 "{} is not in the Dataset",
-                QuadRef::from(quad)
+                quad.as_ref()
             )))
         }
     }
@@ -178,7 +175,7 @@ impl PyDataset {
     /// >>> quad in dataset
     /// False
     fn discard(&mut self, quad: &PyQuad) {
-        self.inner.remove(quad);
+        self.inner.remove(quad.as_ref());
     }
 
     /// Removes all quads from the dataset.
@@ -217,10 +214,6 @@ impl PyDataset {
         self.inner.canonicalize(algorithm.inner)
     }
 
-    fn __str__(&self) -> String {
-        self.inner.to_string()
-    }
-
     fn __bool__(&self) -> bool {
         self.inner.is_empty()
     }
@@ -230,19 +223,20 @@ impl PyDataset {
     }
 
     fn __contains__(&self, quad: &PyQuad) -> bool {
-        self.inner.contains(quad)
+        self.inner.contains(quad.as_ref())
     }
 
     fn __iter__(&self) -> QuadIter {
         // TODO: very inefficient
         QuadIter {
-            inner: self
-                .inner
-                .iter()
-                .map(QuadRef::into_owned)
-                .collect::<Vec<_>>()
-                .into_iter(),
+            inner: self.inner.iter().collect::<Vec<_>>().into_iter(),
         }
+    }
+}
+
+impl fmt::Display for PyDataset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
     }
 }
 

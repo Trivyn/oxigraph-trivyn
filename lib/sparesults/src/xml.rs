@@ -1,14 +1,12 @@
 //! Implementation of [SPARQL Query Results XML Format](https://www.w3.org/TR/rdf-sparql-XMLres/)
 
-#![allow(clippy::large_enum_variant)]
-
 use crate::error::{QueryResultsParseError, QueryResultsSyntaxError};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::*;
-use quick_xml::escape::{escape, unescape};
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::escape::{EscapeError, resolve_xml_entity};
+use quick_xml::events::{BytesDecl, BytesEnd, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::reader::Config;
-use quick_xml::{Decoder, Error, Reader, Writer};
+use quick_xml::{Decoder, Error, Reader, Writer, XmlVersion};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
@@ -73,7 +71,7 @@ impl<W: Write> WriterXmlSolutionsSerializer<W> {
 
     pub fn serialize<'a>(
         &mut self,
-        solution: impl IntoIterator<Item = (VariableRef<'a>, TermRef<'a>)>,
+        solution: impl IntoIterator<Item = (&'a Variable, &'a Term)>,
     ) -> io::Result<()> {
         let mut buffer = Vec::with_capacity(48);
         self.inner.write(&mut buffer, solution);
@@ -113,7 +111,7 @@ impl<W: AsyncWrite + Unpin> TokioAsyncWriterXmlSolutionsSerializer<W> {
 
     pub async fn serialize<'a>(
         &mut self,
-        solution: impl IntoIterator<Item = (VariableRef<'a>, TermRef<'a>)>,
+        solution: impl IntoIterator<Item = (&'a Variable, &'a Term)>,
     ) -> io::Result<()> {
         let mut buffer = Vec::with_capacity(48);
         self.inner.write(&mut buffer, solution);
@@ -162,7 +160,7 @@ impl InnerXmlSolutionsSerializer {
     fn write<'a>(
         &self,
         output: &mut Vec<Event<'a>>,
-        solution: impl IntoIterator<Item = (VariableRef<'a>, TermRef<'a>)>,
+        solution: impl IntoIterator<Item = (&'a Variable, &'a Term)>,
     ) {
         output.push(Event::Start(BytesStart::new("result")));
         for (variable, value) in solution {
@@ -182,19 +180,11 @@ impl InnerXmlSolutionsSerializer {
     }
 }
 
-fn write_xml_term<'a>(output: &mut Vec<Event<'a>>, term: TermRef<'a>) {
+fn write_xml_term<'a>(output: &mut Vec<Event<'a>>, term: &'a Term) {
     match term {
-        TermRef::NamedNode(uri) => {
-            output.push(Event::Start(BytesStart::new("uri")));
-            output.push(Event::Text(BytesText::new(uri.as_str())));
-            output.push(Event::End(BytesEnd::new("uri")));
-        }
-        TermRef::BlankNode(bnode) => {
-            output.push(Event::Start(BytesStart::new("bnode")));
-            output.push(Event::Text(BytesText::new(bnode.as_str())));
-            output.push(Event::End(BytesEnd::new("bnode")));
-        }
-        TermRef::Literal(literal) => {
+        Term::NamedNode(uri) => write_xml_named_node(output, uri),
+        Term::BlankNode(bnode) => write_xml_blank_node(output, bnode),
+        Term::Literal(literal) => {
             let mut start = BytesStart::new("literal");
             if let Some(language) = literal.language() {
                 start.push_attribute(("xml:lang", language));
@@ -211,7 +201,7 @@ fn write_xml_term<'a>(output: &mut Vec<Event<'a>>, term: TermRef<'a>) {
                     start.push_attribute(("xmlns:its", "http://www.w3.org/2005/11/its"));
                     start.push_attribute(("its:version", "2.0"));
                 }
-            } else if literal.datatype() != xsd::STRING {
+            } else if *literal.datatype() != xsd::STRING {
                 start.push_attribute(("datatype", literal.datatype().as_str()))
             }
             output.push(Event::Start(start));
@@ -221,22 +211,38 @@ fn write_xml_term<'a>(output: &mut Vec<Event<'a>>, term: TermRef<'a>) {
             output.push(Event::End(BytesEnd::new("literal")));
         }
         #[cfg(feature = "sparql-12")]
-        TermRef::Triple(triple) => {
+        Term::Triple(triple) => {
             output.push(Event::Start(BytesStart::new("triple")));
             output.push(Event::Start(BytesStart::new("subject")));
-            write_xml_term(output, triple.subject.as_ref().into());
+            match &triple.subject {
+                NamedOrBlankNode::NamedNode(uri) => write_xml_named_node(output, uri),
+                NamedOrBlankNode::BlankNode(bnode) => write_xml_blank_node(output, bnode),
+            }
             output.push(Event::End(BytesEnd::new("subject")));
             output.push(Event::Start(BytesStart::new("predicate")));
-            write_xml_term(output, triple.predicate.as_ref().into());
+            write_xml_named_node(output, &triple.predicate);
             output.push(Event::End(BytesEnd::new("predicate")));
             output.push(Event::Start(BytesStart::new("object")));
-            write_xml_term(output, triple.object.as_ref());
+            write_xml_term(output, &triple.object);
             output.push(Event::End(BytesEnd::new("object")));
             output.push(Event::End(BytesEnd::new("triple")));
         }
     }
 }
 
+fn write_xml_named_node<'a>(output: &mut Vec<Event<'a>>, uri: &'a NamedNode) {
+    output.push(Event::Start(BytesStart::new("uri")));
+    output.push(Event::Text(BytesText::new(uri.as_str())));
+    output.push(Event::End(BytesEnd::new("uri")));
+}
+
+fn write_xml_blank_node<'a>(output: &mut Vec<Event<'a>>, bnode: &'a BlankNode) {
+    output.push(Event::Start(BytesStart::new("bnode")));
+    output.push(Event::Text(BytesText::new(bnode.as_str())));
+    output.push(Event::End(BytesEnd::new("bnode")));
+}
+
+#[expect(clippy::large_enum_variant)]
 pub enum ReaderXmlQueryResultsParserOutput<R: Read> {
     Solutions {
         variables: Vec<Variable>,
@@ -254,6 +260,8 @@ impl<R: Read> ReaderXmlQueryResultsParserOutput<R> {
             state: ResultsState::Start,
             variables: Vec::new(),
             decoder: reader.decoder(),
+            text_buffer: String::new(),
+            xml_version: XmlVersion::Implicit1_0,
         };
         loop {
             reader_buffer.clear();
@@ -300,6 +308,7 @@ impl<R: Read> ReaderXmlSolutionsParser<R> {
 }
 
 #[cfg(feature = "async-tokio")]
+#[expect(clippy::large_enum_variant)]
 pub enum TokioAsyncReaderXmlQueryResultsParserOutput<R: AsyncRead + Unpin> {
     Solutions {
         variables: Vec<Variable>,
@@ -318,6 +327,8 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderXmlQueryResultsParserOutput<R> {
             state: ResultsState::Start,
             variables: Vec::new(),
             decoder: reader.decoder(),
+            text_buffer: String::new(),
+            xml_version: XmlVersion::Implicit1_0,
         };
         loop {
             reader_buffer.clear();
@@ -370,6 +381,7 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderXmlSolutionsParser<R> {
     }
 }
 
+#[expect(clippy::large_enum_variant)]
 pub enum SliceXmlQueryResultsParserOutput<'a> {
     Solutions {
         variables: Vec<Variable>,
@@ -396,6 +408,8 @@ impl<'a> SliceXmlQueryResultsParserOutput<'a> {
             state: ResultsState::Start,
             variables: Vec::new(),
             decoder: reader.decoder(),
+            text_buffer: String::new(),
+            xml_version: XmlVersion::Implicit1_0,
         };
         loop {
             reader_buffer.clear();
@@ -450,6 +464,8 @@ impl SliceXmlSolutionsParser<'_> {
     }
 }
 
+#[expect(clippy::allow_attributes)]
+#[allow(clippy::large_enum_variant)]
 enum XmlInnerQueryResults {
     Solutions {
         variables: Vec<Variable>,
@@ -471,11 +487,12 @@ struct XmlInnerQueryResultsParser {
     state: ResultsState,
     variables: Vec<Variable>,
     decoder: Decoder,
+    text_buffer: String,
+    xml_version: XmlVersion,
 }
 
 impl XmlInnerQueryResultsParser {
     fn set_options(config: &mut Config) {
-        config.trim_text(true);
         config.expand_empty_elements = true;
     }
 
@@ -507,8 +524,8 @@ impl XmlInnerQueryResultsParser {
                             .filter_map(Result::ok)
                             .find(|attr| attr.key.local_name().as_ref() == b"name")
                             .ok_or_else(|| QueryResultsSyntaxError::msg("No name attribute found for the <variable> tag"))?;
-                        let name = unescape(&self.decoder.decode(&name.value)?)?.into_owned();
-                        let variable = Variable::new(name).map_err(|e| QueryResultsSyntaxError::msg(format!("Invalid variable name: {e}")))?;
+                        let name = name.decoded_and_normalized_value(self.xml_version, self.decoder)?;
+                        let variable = Variable::new(OxString::new_owned(&name)).map_err(|e| QueryResultsSyntaxError::msg(format!("Invalid variable name: {e}")))?;
                         if self.variables.contains(&variable) {
                             return Err(QueryResultsSyntaxError::msg(format!(
                                 "The variable {variable} is declared twice"
@@ -544,11 +561,13 @@ impl XmlInnerQueryResultsParser {
                                 term: None,
                                 lang: None,
                                 #[cfg(feature = "sparql-12")]
-                                direction:None,
+                                direction: None,
                                 datatype: None,
                                 subject_stack: Vec::new(),
                                 predicate_stack: Vec::new(),
                                 object_stack: Vec::new(),
+                                text_buffer: String::new(),
+                                xml_version: self.xml_version,
                             },
                         }))
                     } else if event.local_name().as_ref() != b"link" && event.local_name().as_ref() != b"results" && event.local_name().as_ref() != b"boolean" {
@@ -560,7 +579,16 @@ impl XmlInnerQueryResultsParser {
                 ResultsState::Boolean => Err(QueryResultsSyntaxError::msg(format!("Unexpected tag inside of <boolean> tag: <{}>", self.decoder.decode(event.name().as_ref())?)).into())
             },
             Event::Text(event) => {
-                let value = event.unescape()?;
+                self.text_buffer.push_str(&event.xml_content(self.xml_version)?);
+                Ok(None)
+            }
+            Event::GeneralRef(event) => {
+                decode_xml_entity(&event, &mut self.text_buffer, self.xml_version)?;
+                Ok(None)
+            }
+            Event::End(event) => {
+                let value = take(&mut self.text_buffer);
+                let value = value.trim_matches(|c| matches!(c, '\t' | '\n' | '\r' | ' '));
                 match self.state {
                     ResultsState::Boolean => {
                         if value == "true" {
@@ -571,21 +599,25 @@ impl XmlInnerQueryResultsParser {
                             Err(QueryResultsSyntaxError::msg(format!("Unexpected boolean value. Found '{value}'")).into())
                         }
                     }
-                    _ => Err(QueryResultsSyntaxError::msg(format!("Unexpected textual value found: '{value}'")).into())
-                }
-            }
-            Event::End(event) => {
-                if let ResultsState::Head = self.state {
-                    if event.local_name().as_ref() == b"head" {
-                        self.state = ResultsState::AfterHead
+                    ResultsState::Head => {
+                        if event.local_name().as_ref() == b"head" {
+                            self.state = ResultsState::AfterHead;
+                        }
+                        Ok(None)
                     }
-                    Ok(None)
-                } else {
-                    Err(QueryResultsSyntaxError::msg("Unexpected early file end. All results file must have a <head> and a <result> or <boolean> tag").into())
+                    _ => if value.is_empty() {
+                        Err(QueryResultsSyntaxError::msg("Unexpected early file end. All results file must have a <head> and a <result> or <boolean> tag").into())
+                    } else {
+                        Err(QueryResultsSyntaxError::msg(format!("Unexpected textual value found: '{value}'")).into())
+                    }
                 }
             }
             Event::Eof => Err(QueryResultsSyntaxError::msg("Unexpected early file end. All results file must have a <head> and a <result> or <boolean> tag").into()),
-            Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {
+            Event::Decl(event) => {
+                self.xml_version = event.xml_version()?;
+                Ok(None)
+            }
+            Event::Comment(_) | Event::PI(_) | Event::DocType(_) => {
                 Ok(None)
             }
             Event::Empty(_) => unreachable!("Empty events are expended"),
@@ -614,18 +646,20 @@ enum State {
 
 struct XmlInnerSolutionsParser {
     decoder: Decoder,
-    mapping: HashMap<String, usize>,
+    mapping: HashMap<OxString, usize>,
     state_stack: Vec<State>,
     new_bindings: Vec<Option<Term>>,
-    current_var: Option<String>,
+    current_var: Option<OxString>,
     term: Option<Term>,
-    lang: Option<String>,
+    lang: Option<OxString>,
     #[cfg(feature = "sparql-12")]
-    direction: Option<String>,
+    direction: Option<BaseDirection>,
     datatype: Option<NamedNode>,
     subject_stack: Vec<Term>,
     predicate_stack: Vec<Term>,
     object_stack: Vec<Term>,
+    text_buffer: String,
+    xml_version: XmlVersion,
 }
 
 impl XmlInnerSolutionsParser {
@@ -662,8 +696,9 @@ impl XmlInnerSolutionsParser {
                             )
                             .into());
                         };
-                        self.current_var =
-                            Some(unescape(&self.decoder.decode(&attr.value)?)?.into_owned());
+                        self.current_var = Some(OxString::new_owned(
+                            &attr.decoded_and_normalized_value(self.xml_version, self.decoder)?,
+                        ));
                         self.state_stack.push(State::Binding);
                         Ok(None)
                     } else {
@@ -691,23 +726,42 @@ impl XmlInnerSolutionsParser {
                         for attr in event.attributes() {
                             let attr = attr.map_err(Error::from)?;
                             if attr.key.as_ref() == b"xml:lang" {
-                                self.lang = Some(
-                                    unescape(&self.decoder.decode(&attr.value)?)?.into_owned(),
-                                );
+                                self.lang =
+                                    Some(OxString::new_owned(&attr.decoded_and_normalized_value(
+                                        self.xml_version,
+                                        self.decoder,
+                                    )?));
                             } else if attr.key.local_name().as_ref() == b"datatype" {
-                                let iri = self.decoder.decode(&attr.value)?;
-                                let iri = unescape(&iri)?;
-                                self.datatype =
-                                    Some(NamedNode::new(iri.as_ref()).map_err(|e| {
+                                let iri = attr
+                                    .decoded_and_normalized_value(self.xml_version, self.decoder)?;
+                                self.datatype = Some(
+                                    NamedNode::new(OxString::new_owned(&iri)).map_err(|e| {
                                         QueryResultsSyntaxError::msg(format!(
                                             "Invalid datatype IRI '{iri}': {e}"
                                         ))
-                                    })?);
+                                    })?,
+                                );
                             }
                             #[cfg(feature = "sparql-12")]
                             if attr.key.as_ref() == b"its:dir" {
+                                let value = attr
+                                    .decoded_and_normalized_value(self.xml_version, self.decoder)?;
                                 self.direction = Some(
-                                    unescape(&self.decoder.decode(&attr.value)?)?.into_owned(),
+                                    match attr
+                                        .decoded_and_normalized_value(
+                                            self.xml_version,
+                                            self.decoder,
+                                        )?
+                                        .as_ref()
+                                    {
+                                        "ltr" => BaseDirection::Ltr,
+                                        "rtl" => BaseDirection::Rtl,
+                                        _ => {
+                                            return Err(QueryResultsSyntaxError::msg(format!(
+                                                "Invalid its:dir value '{value}', expecting 'ltr' or 'rtl'"
+                                            )).into());
+                                        }
+                                    },
                                 );
                             }
                         }
@@ -759,36 +813,88 @@ impl XmlInnerSolutionsParser {
                 .into()),
             },
             Event::Text(event) => {
-                let data = event.unescape()?;
-                match self.state_stack.last() {
-                    Some(State::Uri) => {
+                self.text_buffer
+                    .push_str(&event.xml_content(self.xml_version)?);
+                Ok(None)
+            }
+            Event::End(_) => {
+                let value = take(&mut self.text_buffer);
+                let value = OxString::new_owned(
+                    value.trim_matches(|c| matches!(c, '\t' | '\n' | '\r' | ' ')),
+                );
+                match self.state_stack.pop().ok_or_else(|| {
+                    QueryResultsSyntaxError::msg(
+                        "Extra XML is not allowed at the end of the document",
+                    )
+                })? {
+                    State::Start => Ok(None),
+                    State::Result => Ok(Some(take(&mut self.new_bindings))),
+                    State::Binding => {
+                        if let Some(var) = &self.current_var {
+                            if let Some(var) = self.mapping.get(var.as_str()) {
+                                self.new_bindings[*var] = self.term.take()
+                            } else {
+                                return Err(
+                                    QueryResultsSyntaxError::msg(format!("The variable '{var}' is used in a binding but not declared in the variables list")).into()
+                                );
+                            }
+                        } else {
+                            return Err(QueryResultsSyntaxError::msg(
+                                "No name found for <binding> tag",
+                            )
+                            .into());
+                        }
+                        Ok(None)
+                    }
+                    State::Subject => {
+                        if let Some(subject) = self.term.take() {
+                            self.subject_stack.push(subject)
+                        }
+                        Ok(None)
+                    }
+                    State::Predicate => {
+                        if let Some(predicate) = self.term.take() {
+                            self.predicate_stack.push(predicate)
+                        }
+                        Ok(None)
+                    }
+                    State::Object => {
+                        if let Some(object) = self.term.take() {
+                            self.object_stack.push(object)
+                        }
+                        Ok(None)
+                    }
+                    State::Uri => {
                         self.term = Some(
-                            NamedNode::new(data.to_string())
+                            NamedNode::new(value.clone())
                                 .map_err(|e| {
                                     QueryResultsSyntaxError::msg(format!(
-                                        "Invalid IRI value '{data}': {e}"
+                                        "Invalid IRI value '{value}': {e}"
                                     ))
                                 })?
                                 .into(),
                         );
                         Ok(None)
                     }
-                    Some(State::BNode) => {
+                    State::BNode => {
                         self.term = Some(
-                            BlankNode::new(data.to_string())
-                                .map_err(|e| {
+                            if value.is_empty() {
+                                BlankNode::default()
+                            } else {
+                                BlankNode::new(value.clone()).map_err(|e| {
                                     QueryResultsSyntaxError::msg(format!(
-                                        "Invalid blank node value '{data}': {e}"
+                                        "Invalid blank node value '{value}': {e}"
                                     ))
                                 })?
-                                .into(),
+                            }
+                            .into(),
                         );
                         Ok(None)
                     }
-                    Some(State::Literal) => {
+                    State::Literal => {
                         self.term = Some(
                             build_literal(
-                                data,
+                                value,
                                 self.lang.take(),
                                 #[cfg(feature = "sparql-12")]
                                 self.direction.take(),
@@ -798,129 +904,67 @@ impl XmlInnerSolutionsParser {
                         );
                         Ok(None)
                     }
-                    _ => Err(QueryResultsSyntaxError::msg(format!(
-                        "Unexpected textual value found: {data}"
-                    ))
-                    .into()),
+                    State::Triple => {
+                        #[cfg(feature = "sparql-12")]
+                        if let (Some(subject), Some(predicate), Some(object)) = (
+                            self.subject_stack.pop(),
+                            self.predicate_stack.pop(),
+                            self.object_stack.pop(),
+                        ) {
+                            self.term = Some(
+                                Triple::new(
+                                    match subject {
+                                        Term::NamedNode(subject) => NamedOrBlankNode::from(subject),
+                                        Term::BlankNode(subject) => NamedOrBlankNode::from(subject),
+                                        Term::Triple(_) => {
+                                            return Err(QueryResultsSyntaxError::msg(
+                                                "The <subject> value cannot be a <triple>",
+                                            )
+                                            .into());
+                                        }
+                                        Term::Literal(_) => {
+                                            return Err(QueryResultsSyntaxError::msg(
+                                                "The <subject> value cannot be a <literal>",
+                                            )
+                                            .into());
+                                        }
+                                    },
+                                    if let Term::NamedNode(predicate) = predicate {
+                                        predicate
+                                    } else {
+                                        return Err(QueryResultsSyntaxError::msg(
+                                            "The <predicate> value must be an <uri>",
+                                        )
+                                        .into());
+                                    },
+                                    object,
+                                )
+                                .into(),
+                            );
+                            Ok(None)
+                        } else {
+                            Err(QueryResultsSyntaxError::msg(
+                                "A <triple> must contain a <subject>, a <predicate> and an <object>",
+                            )
+                                .into())
+                        }
+                        #[cfg(not(feature = "sparql-12"))]
+                        {
+                            Err(QueryResultsSyntaxError::msg(
+                                "The <triple> tag is only supported in RDF 1.2",
+                            )
+                            .into())
+                        }
+                    }
                 }
             }
-            Event::End(_) => match self.state_stack.pop().ok_or_else(|| {
-                QueryResultsSyntaxError::msg("Extra XML is not allowed at the end of the document")
-            })? {
-                State::Start | State::Uri => Ok(None),
-                State::Result => Ok(Some(take(&mut self.new_bindings))),
-                State::Binding => {
-                    if let Some(var) = &self.current_var {
-                        if let Some(var) = self.mapping.get(var) {
-                            self.new_bindings[*var] = self.term.take()
-                        } else {
-                            return Err(
-                                QueryResultsSyntaxError::msg(format!("The variable '{var}' is used in a binding but not declared in the variables list")).into()
-                            );
-                        }
-                    } else {
-                        return Err(QueryResultsSyntaxError::msg(
-                            "No name found for <binding> tag",
-                        )
-                        .into());
-                    }
-                    Ok(None)
-                }
-                State::Subject => {
-                    if let Some(subject) = self.term.take() {
-                        self.subject_stack.push(subject)
-                    }
-                    Ok(None)
-                }
-                State::Predicate => {
-                    if let Some(predicate) = self.term.take() {
-                        self.predicate_stack.push(predicate)
-                    }
-                    Ok(None)
-                }
-                State::Object => {
-                    if let Some(object) = self.term.take() {
-                        self.object_stack.push(object)
-                    }
-                    Ok(None)
-                }
-                State::BNode => {
-                    if self.term.is_none() {
-                        // We default to a random bnode
-                        self.term = Some(BlankNode::default().into())
-                    }
-                    Ok(None)
-                }
-                State::Literal => {
-                    if self.term.is_none() {
-                        // We default to the empty literal
-                        self.term = Some(
-                            build_literal(
-                                "",
-                                self.lang.take(),
-                                #[cfg(feature = "sparql-12")]
-                                self.direction.take(),
-                                self.datatype.take(),
-                            )?
-                            .into(),
-                        )
-                    }
-                    Ok(None)
-                }
-                State::Triple => {
-                    #[cfg(feature = "sparql-12")]
-                    if let (Some(subject), Some(predicate), Some(object)) = (
-                        self.subject_stack.pop(),
-                        self.predicate_stack.pop(),
-                        self.object_stack.pop(),
-                    ) {
-                        self.term = Some(
-                            Triple::new(
-                                match subject {
-                                    Term::NamedNode(subject) => NamedOrBlankNode::from(subject),
-                                    Term::BlankNode(subject) => NamedOrBlankNode::from(subject),
-                                    Term::Triple(_) => {
-                                        return Err(QueryResultsSyntaxError::msg(
-                                            "The <subject> value cannot be a <triple>",
-                                        )
-                                        .into());
-                                    }
-                                    Term::Literal(_) => {
-                                        return Err(QueryResultsSyntaxError::msg(
-                                            "The <subject> value cannot be a <literal>",
-                                        )
-                                        .into());
-                                    }
-                                },
-                                if let Term::NamedNode(predicate) = predicate {
-                                    predicate
-                                } else {
-                                    return Err(QueryResultsSyntaxError::msg(
-                                        "The <predicate> value must be an <uri>",
-                                    )
-                                    .into());
-                                },
-                                object,
-                            )
-                            .into(),
-                        );
-                        Ok(None)
-                    } else {
-                        Err(QueryResultsSyntaxError::msg(
-                            "A <triple> must contain a <subject>, a <predicate> and an <object>",
-                        )
-                        .into())
-                    }
-                    #[cfg(not(feature = "sparql-12"))]
-                    {
-                        Err(QueryResultsSyntaxError::msg(
-                            "The <triple> tag is only supported in RDF 1.2",
-                        )
-                        .into())
-                    }
-                }
-            },
-            Event::Eof | Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {
+            Event::Decl(event) => {
+                self.xml_version = event.xml_version()?;
+                Ok(None)
+            }
+            Event::Eof | Event::Comment(_) | Event::PI(_) | Event::DocType(_) => Ok(None),
+            Event::GeneralRef(event) => {
+                decode_xml_entity(&event, &mut self.text_buffer, self.xml_version)?;
                 Ok(None)
             }
             Event::Empty(_) => unreachable!("Empty events are expended"),
@@ -933,9 +977,9 @@ impl XmlInnerSolutionsParser {
 }
 
 fn build_literal(
-    value: impl Into<String>,
-    lang: Option<String>,
-    #[cfg(feature = "sparql-12")] direction: Option<String>,
+    value: OxString,
+    lang: Option<OxString>,
+    #[cfg(feature = "sparql-12")] direction: Option<BaseDirection>,
     datatype: Option<NamedNode>,
 ) -> Result<Literal, QueryResultsSyntaxError> {
     if let Some(lang) = lang {
@@ -950,16 +994,8 @@ fn build_literal(
             }
             return Literal::new_directional_language_tagged_literal(
                 value,
-                &lang,
-                match direction.as_str() {
-                    "ltr" => BaseDirection::Ltr,
-                    "rtl" => BaseDirection::Rtl,
-                    _ => {
-                        return Err(QueryResultsSyntaxError::msg(format!(
-                            "Invalid its:dir value '{direction}', expecting 'ltr' or 'rtl'"
-                        )));
-                    }
-                },
+                lang.clone(),
+                direction,
             )
             .map_err(|e| {
                 QueryResultsSyntaxError::msg(format!("Invalid xml:lang value '{lang}': {e}"))
@@ -972,7 +1008,7 @@ fn build_literal(
                 )));
             }
         }
-        Literal::new_language_tagged_literal(value, &lang).map_err(|e| {
+        Literal::new_language_tagged_literal(value, lang.clone()).map_err(|e| {
             QueryResultsSyntaxError::msg(format!("Invalid xml:lang value '{lang}': {e}"))
         })
     } else {
@@ -990,39 +1026,56 @@ fn build_literal(
     }
 }
 
-/// Escapes whitespaces at the beginning and the end to make sure they are not removed by parsers trimming text events.
+/// Escapes characters to avoid parsing issues (<, >, &...) or normalization (\r, whitespace at the beginning or end...)
 fn escape_including_bound_whitespaces(value: &str) -> Cow<'_, str> {
-    let trimmed = value.trim_matches(|c| matches!(c, '\t' | '\n' | '\r' | ' '));
-    let trimmed_escaped = escape(trimmed);
-    if trimmed == value {
-        return trimmed_escaped;
-    }
-    let mut output =
-        String::with_capacity(trimmed_escaped.len() + (value.len() - trimmed.len()) * 5);
-    let mut prefix_len = 0;
-    for c in value.chars() {
+    let mut escaped = None;
+    let mut previous_index = 0;
+    let mut push_escaped = |escape: &'static str, c: char, i: usize| {
+        let buf = escaped.get_or_insert_with(|| String::with_capacity(value.len()));
+        buf.push_str(&value[previous_index..i]);
+        buf.push_str(escape);
+        previous_index = i + c.len_utf8();
+    };
+
+    for (i, c) in value.char_indices() {
         match c {
-            '\t' => output.push_str("&#9;"),
-            '\n' => output.push_str("&#10;"),
-            '\r' => output.push_str("&#13;"),
-            ' ' => output.push_str("&#32;"),
-            _ => break,
-        }
-        prefix_len += 1;
-    }
-    output.push_str(&trimmed_escaped);
-    for c in value[prefix_len + trimmed.len()..].chars() {
-        match c {
-            '\t' => output.push_str("&#9;"),
-            '\n' => output.push_str("&#10;"),
-            '\r' => output.push_str("&#13;"),
-            ' ' => output.push_str("&#32;"),
-            _ => {
-                unreachable!("Unexpected {c} at the end of the string {value:?}")
-            }
+            '<' => push_escaped("&lt;", c, i),
+            '>' => push_escaped("&gt;", c, i),
+            '\'' => push_escaped("&apos;", c, i),
+            '&' => push_escaped("&amp;", c, i),
+            '"' => push_escaped("&quot;", c, i),
+            '\r' => push_escaped("&#13;", c, i),
+            '\u{85}' => push_escaped("&#133;", c, i),
+            '\u{2028}' => push_escaped("&#8232;", c, i),
+            '\t' if i == 0 || i == value.len() - 1 => push_escaped("&#9;", c, i),
+            '\n' if i == 0 || i == value.len() - 1 => push_escaped("&#10;", c, i),
+            ' ' if i == 0 || i == value.len() - 1 => push_escaped("&#32;", c, i),
+            _ => (),
         }
     }
-    output.into()
+    if let Some(mut escaped) = escaped {
+        escaped.push_str(&value[previous_index..]);
+        escaped.into()
+    } else {
+        value.into()
+    }
+}
+
+fn decode_xml_entity(
+    event: &BytesRef<'_>,
+    buffer: &mut String,
+    xml_version: XmlVersion,
+) -> Result<(), Error> {
+    if let Some(char_ref) = event.resolve_char_ref()? {
+        buffer.push(char_ref);
+        return Ok(());
+    }
+    let reference = event.xml_content(xml_version)?;
+    let Some(value) = resolve_xml_entity(&reference) else {
+        return Err(EscapeError::UnrecognizedEntity(0..event.len(), reference.into()).into());
+    };
+    buffer.push_str(value);
+    Ok(())
 }
 
 #[cfg(feature = "async-tokio")]

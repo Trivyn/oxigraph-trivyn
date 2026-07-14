@@ -1,8 +1,7 @@
 //! Code inspired by [Rust RocksDB](https://github.com/rust-rocksdb/rust-rocksdb) under Apache License 2.0.
 
-#![allow(
+#![expect(
     unsafe_code,
-    trivial_casts,
     clippy::undocumented_unsafe_blocks,
     clippy::panic_in_result_fn,
     clippy::unwrap_in_result
@@ -19,6 +18,7 @@ use std::error::Error;
 use std::ffi::CString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::thread::available_parallelism;
 use std::{fmt, io, ptr, slice};
@@ -511,11 +511,7 @@ impl Db {
                 key.len(),
             ))
         }?;
-        Ok(if slice.is_null() {
-            None
-        } else {
-            Some(PinnableSlice(slice))
-        })
+        Ok(NonNull::new(slice).map(PinnableSlice))
     }
 
     pub fn contains_key(
@@ -751,6 +747,42 @@ impl Drop for Reader<'_> {
 }
 
 impl<'a> Reader<'a> {
+    pub fn get(
+        &self,
+        column_family: &ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<PinnableSlice>, StorageError> {
+        let slice = unsafe {
+            match &self.inner {
+                InnerReader::ReadOnly(inner) => ffi_result!(oxrocksdb_get_pinned_cf_v2(
+                    inner.db,
+                    self.options,
+                    column_family.0,
+                    key.as_ptr().cast(),
+                    key.len(),
+                )),
+                InnerReader::ReadWrite(inner) => ffi_result!(oxrocksdb_get_pinned_cf_v2(
+                    inner.db.db,
+                    self.options,
+                    column_family.0,
+                    key.as_ptr().cast(),
+                    key.len(),
+                )),
+                InnerReader::Transaction(inner) => {
+                    ffi_result!(oxrocksdb_writebatch_wi_get_pinned_cf_v2(
+                        inner.batch,
+                        inner.db.db,
+                        self.options,
+                        column_family.0,
+                        key.as_ptr().cast(),
+                        key.len(),
+                    ))
+                }
+            }
+        }?;
+        Ok(NonNull::new(slice).map(PinnableSlice))
+    }
+
     pub fn contains_key(
         &self,
         column_family: &ColumnFamily,
@@ -1024,12 +1056,12 @@ impl ReadableTransaction<'_> {
     }
 }
 
-pub struct PinnableSlice(*mut oxrocksdb_pinnable_handle_t);
+pub struct PinnableSlice(NonNull<oxrocksdb_pinnable_handle_t>);
 
 impl Drop for PinnableSlice {
     fn drop(&mut self) {
         unsafe {
-            oxrocksdb_pinnable_handle_destroy(self.0);
+            oxrocksdb_pinnable_handle_destroy(self.0.as_ptr());
         }
     }
 }
@@ -1040,7 +1072,7 @@ impl Deref for PinnableSlice {
     fn deref(&self) -> &Self::Target {
         unsafe {
             let mut len = 0;
-            let val = oxrocksdb_pinnable_handle_get_value(self.0, &raw mut len);
+            let val = oxrocksdb_pinnable_handle_get_value(self.0.as_ptr(), &raw mut len);
             slice::from_raw_parts(val.cast(), len)
         }
     }
@@ -1055,12 +1087,6 @@ impl AsRef<[u8]> for PinnableSlice {
 impl Borrow<[u8]> for PinnableSlice {
     fn borrow(&self) -> &[u8] {
         self
-    }
-}
-
-impl From<PinnableSlice> for Vec<u8> {
-    fn from(value: PinnableSlice) -> Self {
-        value.to_vec()
     }
 }
 

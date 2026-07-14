@@ -3,7 +3,6 @@ use oxigraph::io::{
     JsonLdProfile, JsonLdProfileSet, RdfFormat, RdfParseError, RdfParser, RdfSerializer,
     ReaderQuadParser,
 };
-use oxigraph::model::QuadRef;
 use pyo3::exceptions::{PySyntaxError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -11,8 +10,10 @@ use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, Read, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -155,10 +156,10 @@ pub fn serialize<'py>(
             for i in input.try_iter()? {
                 let i = i?;
                 if let Ok(triple) = i.extract::<PyRef<'_, PyTriple>>() {
-                    serializer.serialize_triple(&*triple)
+                    serializer.serialize_triple(triple.deref().as_ref())
                 } else {
                     let quad = i.extract::<PyRef<'_, PyQuad>>()?;
-                    let quad = QuadRef::from(&*quad);
+                    let quad = quad.deref().as_ref();
                     if !quad.graph_name.is_default_graph() && !format.supports_datasets() {
                         return Err(PyValueError::new_err(format!(
                             "The {format} format does not support named graphs"
@@ -262,6 +263,7 @@ impl PyQuadParser {
     module = "pyoxigraph",
     eq,
     hash,
+    str,
     from_py_object
 )]
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -405,10 +407,6 @@ impl PyRdfFormat {
         })
     }
 
-    fn __str__(&self) -> &'static str {
-        self.inner.name()
-    }
-
     fn __repr__(&self) -> String {
         format!("<RdfFormat {}>", self.inner.name())
     }
@@ -423,6 +421,12 @@ impl PyRdfFormat {
     #[expect(unused_variables)]
     fn __deepcopy__<'a>(slf: PyRef<'a, Self>, memo: &'_ Bound<'_, PyAny>) -> PyRef<'a, Self> {
         slf
+    }
+}
+
+impl fmt::Display for PyRdfFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
     }
 }
 
@@ -547,6 +551,12 @@ pub enum PyWritableOutput {
 }
 
 pub struct PyIo(Py<PyAny>);
+
+impl PyIo {
+    pub fn new(io: Py<PyAny>) -> Self {
+        Self(io)
+    }
+}
 
 impl Read for PyIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

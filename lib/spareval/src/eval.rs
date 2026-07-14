@@ -14,8 +14,8 @@ use crate::{
 use json_event_parser::{JsonEvent, WriterJsonSerializer};
 use oxiri::Iri;
 #[cfg(feature = "sparql-12")]
-use oxrdf::{BaseDirection, NamedOrBlankNode};
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Term, Triple, Variable};
+use oxrdf::NamedOrBlankNode;
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, OxString, Term, Triple, Variable};
 use oxsdatatypes::{DateTime, DayTimeDuration, Decimal, Double, Float, Integer};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
 use spargebra::algebra::{AggregateFunction, PropertyPathExpression};
@@ -30,9 +30,11 @@ use sparopt::algebra::{
 };
 use std::cell::Cell;
 use std::cmp::Ordering;
+use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::iter::{Peekable, empty, once};
 use std::marker::PhantomData;
+use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, atomic};
@@ -303,14 +305,17 @@ struct EncodedDatasetSpec<T> {
     named: Option<Vec<T>>,
 }
 
+#[derive(Clone)]
 pub struct InternalTuple<T> {
     inner: Vec<Option<T>>,
+    graph_name: Option<T>,
 }
 
 impl<T> InternalTuple<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Vec::with_capacity(capacity),
+            graph_name: None,
         }
     }
 
@@ -356,7 +361,10 @@ impl<T: Clone + Eq> InternalTuple<T> {
                     }
                 }
             }
-            Some(Self { inner: result })
+            Some(Self {
+                inner: result,
+                graph_name: self.graph_name.clone(),
+            })
         } else {
             let mut result = self.inner.clone();
             for (key, other_value) in other.inner.iter().enumerate() {
@@ -371,15 +379,10 @@ impl<T: Clone + Eq> InternalTuple<T> {
                     }
                 }
             }
-            Some(Self { inner: result })
-        }
-    }
-}
-
-impl<T: Clone> Clone for InternalTuple<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
+            Some(Self {
+                inner: result,
+                graph_name: self.graph_name.clone(),
+            })
         }
     }
 }
@@ -413,7 +416,7 @@ type InternalTuplesIterator<'a, T> =
 
 pub struct SimpleEvaluator<'a, D: QueryableDataset<'a>> {
     dataset: EvalDataset<'a, D>,
-    base_iri: Option<Arc<Iri<String>>>,
+    base_iri: Option<Iri<OxString>>,
     now: DateTime,
     service_handler: Rc<ServiceHandlerRegistry>,
     custom_functions: Rc<CustomFunctionRegistry>,
@@ -424,7 +427,7 @@ pub struct SimpleEvaluator<'a, D: QueryableDataset<'a>> {
 impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
     pub fn new(
         dataset: D,
-        base_iri: Option<Arc<Iri<String>>>,
+        base_iri: Option<Iri<OxString>>,
         service_handler: Rc<ServiceHandlerRegistry>,
         custom_functions: Rc<CustomFunctionRegistry>,
         custom_aggregate_functions: Rc<CustomAggregateFunctionRegistry>,
@@ -677,7 +680,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     Box::new(
                         encoded_tuples
                             .iter()
-                            .filter_map(move |t| t.combine_with(&from))
+                            .filter_map(move |t| from.combine_with(t))
                             .map(Ok)
                             .collect::<Vec<_>>()
                             .into_iter(),
@@ -751,7 +754,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         }
                         .map(Some)
                     } else {
-                        Some(None) // default graph
+                        Some(from.graph_name.clone()) // default graph
                     };
                     let iter = dataset.internal_quads_for_pattern(
                         input_subject.as_ref(),
@@ -820,7 +823,6 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 subject,
                 path,
                 object,
-                graph_name,
             } => {
                 let subject_selector = TupleSelector::from_ground_term_pattern(
                     subject,
@@ -833,15 +835,6 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     encoded_variables,
                     &self.dataset,
                 )?;
-                let graph_name_selector = if let Some(graph_name) = graph_name.as_ref() {
-                    Some(TupleSelector::from_named_node_pattern(
-                        graph_name,
-                        encoded_variables,
-                        &self.dataset,
-                    )?)
-                } else {
-                    None
-                };
                 let dataset = self.dataset.clone();
                 Rc::new(move |from| {
                     let input_subject = match subject_selector.get_pattern_value(
@@ -863,43 +856,26 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         Ok(value) => value,
                         Err(e) => return Box::new(once(Err(e))),
                     };
-                    let input_graph_name = if let Some(graph_name_selector) = &graph_name_selector {
-                        match graph_name_selector.get_pattern_value(
-                            &from,
-                            #[cfg(feature = "sparql-12")]
-                            &dataset,
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => return Box::new(once(Err(e))),
-                        }
-                        .map(Some)
-                    } else {
-                        Some(None) // default graph
-                    };
-                    match (input_subject, input_object, input_graph_name) {
-                        (Some(input_subject), Some(input_object), Some(input_graph_name)) => {
-                            match path_eval.eval_closed_in_graph(
+                    match (input_subject, input_object) {
+                        (Some(input_subject), Some(input_object)) => {
+                            match path_eval.eval_closed(
                                 &path,
                                 &input_subject,
                                 &input_object,
-                                input_graph_name.as_ref(),
+                                from.graph_name.as_ref(),
                             ) {
                                 Ok(true) => Box::new(once(Ok(from))),
                                 Ok(false) => Box::new(empty()),
                                 Err(e) => Box::new(once(Err(e))),
                             }
                         }
-                        (Some(input_subject), None, Some(input_graph_name)) => {
+                        (Some(input_subject), None) => {
                             let object_selector = object_selector.clone();
                             #[cfg(feature = "sparql-12")]
                             let dataset = dataset.clone();
                             Box::new(
                                 path_eval
-                                    .eval_from_in_graph(
-                                        &path,
-                                        &input_subject,
-                                        input_graph_name.as_ref(),
-                                    )
+                                    .eval_from(&path, &input_subject, from.graph_name.as_ref())
                                     .map(move |o| {
                                         let o = o?;
                                         let mut new_tuple = from.clone();
@@ -917,17 +893,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                     .filter_map(Result::transpose),
                             )
                         }
-                        (None, Some(input_object), Some(input_graph_name)) => {
+                        (None, Some(input_object)) => {
                             let subject_selector = subject_selector.clone();
                             #[cfg(feature = "sparql-12")]
                             let dataset = dataset.clone();
                             Box::new(
                                 path_eval
-                                    .eval_to_in_graph(
-                                        &path,
-                                        &input_object,
-                                        input_graph_name.as_ref(),
-                                    )
+                                    .eval_to(&path, &input_object, from.graph_name.as_ref())
                                     .map(move |s| {
                                         let s = s?;
                                         let mut new_tuple = from.clone();
@@ -945,14 +917,14 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                     .filter_map(Result::transpose),
                             )
                         }
-                        (None, None, Some(input_graph_name)) => {
+                        (None, None) => {
                             let subject_selector = subject_selector.clone();
                             let object_selector = object_selector.clone();
                             #[cfg(feature = "sparql-12")]
                             let dataset = dataset.clone();
                             Box::new(
                                 path_eval
-                                    .eval_open_in_graph(&path, input_graph_name.as_ref())
+                                    .eval_open(&path, from.graph_name.as_ref())
                                     .map(move |t| {
                                         let (s, o) = t?;
                                         let mut new_tuple = from.clone();
@@ -979,185 +951,20 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                     .filter_map(Result::transpose),
                             )
                         }
-                        (Some(input_subject), Some(input_object), None) => {
-                            let graph_name_selector = graph_name_selector.clone();
-                            #[cfg(feature = "sparql-12")]
-                            let dataset = dataset.clone();
-                            Box::new(
-                                path_eval
-                                    .eval_closed_in_unknown_graph(
-                                        &path,
-                                        &input_subject,
-                                        &input_object,
-                                    )
-                                    .map(move |g| {
-                                        let g = g?;
-                                        let mut new_tuple = from.clone();
-                                        if let Some(graph_name_selector) = &graph_name_selector {
-                                            let Some(g) = g else {
-                                                return Err(
-                                                    QueryEvaluationError::UnexpectedDefaultGraph,
-                                                );
-                                            };
-                                            if !put_pattern_value::<D>(
-                                                graph_name_selector,
-                                                g,
-                                                &mut new_tuple,
-                                                #[cfg(feature = "sparql-12")]
-                                                &dataset,
-                                            )? {
-                                                return Ok(None);
-                                            }
-                                        }
-                                        Ok(Some(new_tuple))
-                                    })
-                                    .filter_map(Result::transpose),
-                            )
-                        }
-                        (Some(input_subject), None, None) => {
-                            let object_selector = object_selector.clone();
-                            let graph_name_selector = graph_name_selector.clone();
-                            #[cfg(feature = "sparql-12")]
-                            let dataset = dataset.clone();
-                            Box::new(
-                                path_eval
-                                    .eval_from_in_unknown_graph(&path, &input_subject)
-                                    .map(move |t| {
-                                        let (o, g) = t?;
-                                        let mut new_tuple = from.clone();
-                                        if !put_pattern_value::<D>(
-                                            &object_selector,
-                                            o,
-                                            &mut new_tuple,
-                                            #[cfg(feature = "sparql-12")]
-                                            &dataset,
-                                        )? {
-                                            return Ok(None);
-                                        }
-                                        if let Some(graph_name_selector) = &graph_name_selector {
-                                            let Some(g) = g else {
-                                                return Err(
-                                                    QueryEvaluationError::UnexpectedDefaultGraph,
-                                                );
-                                            };
-                                            if !put_pattern_value::<D>(
-                                                graph_name_selector,
-                                                g,
-                                                &mut new_tuple,
-                                                #[cfg(feature = "sparql-12")]
-                                                &dataset,
-                                            )? {
-                                                return Ok(None);
-                                            }
-                                        }
-                                        Ok(Some(new_tuple))
-                                    })
-                                    .filter_map(Result::transpose),
-                            )
-                        }
-                        (None, Some(input_object), None) => {
-                            let subject_selector = subject_selector.clone();
-                            let graph_name_selector = graph_name_selector.clone();
-                            #[cfg(feature = "sparql-12")]
-                            let dataset = dataset.clone();
-                            Box::new(
-                                path_eval
-                                    .eval_to_in_unknown_graph(&path, &input_object)
-                                    .map(move |t| {
-                                        let (s, g) = t?;
-                                        let mut new_tuple = from.clone();
-                                        if !put_pattern_value::<D>(
-                                            &subject_selector,
-                                            s,
-                                            &mut new_tuple,
-                                            #[cfg(feature = "sparql-12")]
-                                            &dataset,
-                                        )? {
-                                            return Ok(None);
-                                        }
-                                        if let Some(graph_name_selector) = &graph_name_selector {
-                                            let Some(g) = g else {
-                                                return Err(
-                                                    QueryEvaluationError::UnexpectedDefaultGraph,
-                                                );
-                                            };
-                                            if !put_pattern_value::<D>(
-                                                graph_name_selector,
-                                                g,
-                                                &mut new_tuple,
-                                                #[cfg(feature = "sparql-12")]
-                                                &dataset,
-                                            )? {
-                                                return Ok(None);
-                                            }
-                                        }
-                                        Ok(Some(new_tuple))
-                                    })
-                                    .filter_map(Result::transpose),
-                            )
-                        }
-                        (None, None, None) => {
-                            let subject_selector = subject_selector.clone();
-                            let object_selector = object_selector.clone();
-                            let graph_name_selector = graph_name_selector.clone();
-                            #[cfg(feature = "sparql-12")]
-                            let dataset = dataset.clone();
-                            Box::new(
-                                path_eval
-                                    .eval_open_in_unknown_graph(&path)
-                                    .map(move |t| {
-                                        let (s, o, g) = t?;
-                                        let mut new_tuple = from.clone();
-                                        if !put_pattern_value::<D>(
-                                            &subject_selector,
-                                            s,
-                                            &mut new_tuple,
-                                            #[cfg(feature = "sparql-12")]
-                                            &dataset,
-                                        )? {
-                                            return Ok(None);
-                                        }
-                                        if !put_pattern_value::<D>(
-                                            &object_selector,
-                                            o,
-                                            &mut new_tuple,
-                                            #[cfg(feature = "sparql-12")]
-                                            &dataset,
-                                        )? {
-                                            return Ok(None);
-                                        }
-                                        if let Some(graph_name_selector) = &graph_name_selector {
-                                            let Some(g) = g else {
-                                                return Err(
-                                                    QueryEvaluationError::UnexpectedDefaultGraph,
-                                                );
-                                            };
-                                            if !put_pattern_value::<D>(
-                                                graph_name_selector,
-                                                g,
-                                                &mut new_tuple,
-                                                #[cfg(feature = "sparql-12")]
-                                                &dataset,
-                                            )? {
-                                                return Ok(None);
-                                            }
-                                        }
-                                        Ok(Some(new_tuple))
-                                    })
-                                    .filter_map(Result::transpose),
-                            )
-                        }
                     }
                 })
             }
-            GraphPattern::Graph { graph_name } => {
+            GraphPattern::Graph { graph_name, inner } => {
+                let (child, child_stats) = self.graph_pattern_evaluator(inner, encoded_variables);
+                stat_children.push(child_stats);
+                let child = child?;
                 let graph_name_selector = TupleSelector::from_named_node_pattern(
                     graph_name,
                     encoded_variables,
                     &self.dataset,
                 )?;
                 let dataset = self.dataset.clone();
-                Rc::new(move |from| {
+                Rc::new(move |mut from| {
                     let input_graph_name = match graph_name_selector.get_pattern_value(
                         &from,
                         #[cfg(feature = "sparql-12")]
@@ -1168,32 +975,51 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     };
                     if let Some(input_graph_name) = input_graph_name {
                         match dataset.contains_internal_graph_name(&input_graph_name) {
-                            Ok(true) => Box::new(once(Ok(from))),
+                            Ok(true) => {
+                                let previous_graph_name = take(&mut from.graph_name);
+                                from.graph_name = Some(input_graph_name);
+                                Box::new(child(from).map(move |tuple| {
+                                    let mut tuple = tuple?;
+                                    tuple.graph_name.clone_from(&previous_graph_name);
+                                    Ok(tuple)
+                                }))
+                            }
                             Ok(false) => Box::new(empty()),
                             Err(e) => Box::new(once(Err(e))),
                         }
                     } else {
                         let graph_name_selector = graph_name_selector.clone();
+                        let child = Rc::clone(&child);
                         #[cfg(feature = "sparql-12")]
                         let dataset = dataset.clone();
+                        let previous_graph_name = take(&mut from.graph_name);
                         Box::new(
                             dataset
                                 .internal_named_graphs()
-                                .map(move |graph_name| {
-                                    let graph_name = graph_name?;
-                                    let mut new_tuple = from.clone();
-                                    if !put_pattern_value::<D>(
-                                        &graph_name_selector,
-                                        graph_name,
-                                        &mut new_tuple,
-                                        #[cfg(feature = "sparql-12")]
-                                        &dataset,
-                                    )? {
-                                        return Ok(None);
-                                    }
-                                    Ok(Some(new_tuple))
-                                })
-                                .filter_map(Result::transpose),
+                                .flat_map_ok(move |graph_name| {
+                                    let graph_name_selector = graph_name_selector.clone();
+                                    #[cfg(feature = "sparql-12")]
+                                    let dataset = dataset.clone();
+                                    let previous_graph_name = previous_graph_name.clone();
+                                    let mut from = from.clone();
+                                    from.graph_name = Some(graph_name.clone());
+                                    child(from)
+                                        .map(move |tuple| {
+                                            let mut tuple = tuple?;
+                                            if !put_pattern_value::<D>(
+                                                &graph_name_selector,
+                                                graph_name.clone(),
+                                                &mut tuple,
+                                                #[cfg(feature = "sparql-12")]
+                                                &dataset,
+                                            )? {
+                                                return Ok(None);
+                                            }
+                                            tuple.graph_name.clone_from(&previous_graph_name);
+                                            Ok(Some(tuple))
+                                        })
+                                        .filter_map(Result::transpose)
+                                }),
                         )
                     }
                 })
@@ -1303,7 +1129,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         return Ok(Rc::new(move |from| {
                             Box::new(ForLoopLeftJoinIterator {
                                 right_evaluator: Rc::clone(&right),
-                                left_iter: left(from),
+                                left_iter: left(from.clone()),
                                 current_right: Box::new(empty()),
                                 left_tuple_to_yield: None,
                             })
@@ -1315,7 +1141,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 let right = right?;
                 Rc::new(move |from| {
                     let right = Rc::clone(&right);
-                    Box::new(left(from).flat_map(move |t| match t {
+                    Box::new(left(from.clone()).flat_map(move |t| match t {
                         Ok(t) => right(t),
                         Err(e) => Box::new(once(Err(e))),
                     }))
@@ -1444,9 +1270,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 )?;
                 Rc::new(move |from| {
                     let expression = Rc::clone(&expression);
-                    Box::new(child(from).filter(move |tuple| match tuple {
-                        Ok(tuple) => expression(tuple).unwrap_or(false),
-                        Err(_) => true,
+                    Box::new(child(from).filter_map(move |tuple| match tuple {
+                        Ok(tuple) => match expression(&tuple) {
+                            Ok(Some(true)) => Some(Ok(tuple)),
+                            Ok(Some(false) | None) => None,
+                            Err(error) => Some(Err(error)),
+                        },
+                        Err(error) => Some(Err(error)),
                     }))
                 })
             }
@@ -1489,7 +1319,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         let expression = Rc::clone(&expression);
                         Box::new(child(from).map(move |tuple| {
                             let mut tuple = tuple?;
-                            if let Some(value) = expression(&tuple) {
+                            if let Some(value) = expression(&tuple)? {
                                 tuple.set(position, value);
                             }
                             Ok(tuple)
@@ -1505,7 +1335,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     let dataset = dataset.clone();
                     Box::new(child(from).map(move |tuple| {
                         let mut tuple = tuple?;
-                        if let Some(value) = expression(&tuple) {
+                        if let Some(value) = expression(&tuple)? {
                             tuple.set(position, dataset.internalize_expression_term(value)?);
                         }
                         Ok(tuple)
@@ -1602,12 +1432,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 let (child, child_stats) = self.graph_pattern_evaluator(inner, encoded_variables);
                 stat_children.push(child_stats);
                 let mut child = child?;
-                #[expect(clippy::shadow_same)]
-                let start = *start;
+                #[expect(clippy::unwrap_in_result)]
+                let start = (*start).try_into().unwrap();
                 if start > 0 {
                     child = Rc::new(move |from| Box::new(child(from).skip(start)));
                 }
-                if let Some(length) = *length {
+                if let Some(length) = (*length).map(|l| l.try_into().unwrap()) {
                     child = Rc::new(move |from| Box::new(child(from).take(length)));
                 }
                 child
@@ -1633,6 +1463,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             input_tuple.set(*input_key, value.clone());
                         }
                     }
+                    input_tuple.graph_name.clone_from(&from.graph_name);
                     Box::new(child(input_tuple).filter_map(move |tuple| {
                         match tuple {
                             Ok(tuple) => {
@@ -1694,29 +1525,28 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>(),
                         );
                     }
-                    child(from)
-                        .filter_map(|result| match result {
-                            Ok(result) => Some(result),
-                            Err(error) => {
-                                errors.push(error);
-                                None
-                            }
-                        })
-                        .for_each(|tuple| {
-                            // TODO avoid copy for key?
-                            let key = key_variables
-                                .iter()
-                                .map(|v| tuple.get(*v).cloned())
-                                .collect();
+                    for result in child(from) {
+                        match result {
+                            Ok(tuple) => {
+                                // TODO avoid copy for key?
+                                let key = key_variables
+                                    .iter()
+                                    .map(|v| tuple.get(*v).cloned())
+                                    .collect();
 
-                            let key_accumulators =
-                                accumulators_for_group.entry(key).or_insert_with(|| {
-                                    accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>()
-                                });
-                            for accumulator in key_accumulators {
-                                accumulator.accumulate(&tuple);
+                                let key_accumulators =
+                                    accumulators_for_group.entry(key).or_insert_with(|| {
+                                        accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>()
+                                    });
+                                for accumulator in key_accumulators {
+                                    if let Err(error) = accumulator.accumulate(&tuple) {
+                                        errors.push(error);
+                                    }
+                                }
                             }
-                        });
+                            Err(error) => errors.push(error),
+                        }
+                    }
                     let accumulator_variables = accumulator_variables.clone();
                     let dataset = dataset.clone();
                     Box::new(
@@ -1807,7 +1637,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         };
         let iter =
             self.service_handler
-                .handle(&service_name, graph_pattern, self.base_iri.as_deref())?;
+                .handle(&service_name, graph_pattern, self.base_iri.as_ref())?;
         Ok(encode_bindings(self.dataset.clone(), variables, iter))
     }
 
@@ -1987,15 +1817,21 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
 
     /// Evaluates an expression and returns an internal term
     ///
-    /// Returns None if building such expression would mean to convert back to an internal term at the end.
-    #[expect(clippy::type_complexity)]
+    /// Returns None if building such expression implies to convert back to an internal term at the end.
     fn internal_expression_evaluator(
         &self,
         expression: &Expression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
     ) -> Result<
-        Option<Rc<dyn Fn(&InternalTuple<D::InternalTerm>) -> Option<D::InternalTerm> + 'a>>,
+        Option<
+            ExpressionEvaluator<
+                'a,
+                InternalTuple<D::InternalTerm>,
+                D::InternalTerm,
+                QueryEvaluationError,
+            >,
+        >,
         QueryEvaluationError,
     > {
         Ok(try_build_internal_expression_evaluator(
@@ -2014,21 +1850,26 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         expression: &Expression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
-    ) -> Result<ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, bool>, QueryEvaluationError>
-    {
+    ) -> Result<
+        ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, bool, QueryEvaluationError>,
+        QueryEvaluationError,
+    > {
         // TODO: avoid dyn?
         if let Some(eval) =
             self.internal_expression_evaluator(expression, encoded_variables, stat_children)?
         {
             let dataset = self.dataset.clone();
             return Ok(Rc::new(move |tuple| {
-                dataset
-                    .internal_term_effective_boolean_value(eval(tuple)?)
-                    .ok()?
+                let Some(term) = eval(tuple)? else {
+                    return Ok(None);
+                };
+                dataset.internal_term_effective_boolean_value(term)
             }));
         }
         let eval = self.expression_evaluator(expression, encoded_variables, stat_children)?;
-        Ok(Rc::new(move |tuple| eval(tuple)?.effective_boolean_value()))
+        Ok(Rc::new(move |tuple| {
+            Ok(eval(tuple)?.and_then(|term| term.effective_boolean_value()))
+        }))
     }
 
     /// Evaluate an expression and return an explicit ExpressionTerm
@@ -2038,7 +1879,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
     ) -> Result<
-        ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, ExpressionTerm>,
+        ExpressionEvaluator<
+            'a,
+            InternalTuple<D::InternalTerm>,
+            ExpressionTerm,
+            QueryEvaluationError,
+        >,
         QueryEvaluationError,
     > {
         Ok(build_expression_evaluator(
@@ -2169,94 +2015,33 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
 
     fn build_internalize_expression_term(
         &mut self,
-    ) -> impl Fn(ExpressionTerm) -> Option<Self::Term> + 'a {
+    ) -> impl Fn(ExpressionTerm) -> Result<Self::Term, Self::Error> + 'a {
         let dataset = self.evaluator.dataset.clone();
-        move |t| dataset.internalize_expression_term(t).ok()
+        move |t| dataset.internalize_expression_term(t)
     }
 
     fn build_externalize_expression_term(
         &mut self,
-    ) -> impl Fn(Self::Term) -> Option<ExpressionTerm> + 'a {
+    ) -> impl Fn(Self::Term) -> Result<ExpressionTerm, Self::Error> + 'a {
         let dataset = self.evaluator.dataset.clone();
-        move |t| dataset.externalize_expression_term(t).ok()
+        move |t| dataset.externalize_expression_term(t)
+    }
+
+    fn build_externalize_term(&mut self) -> impl Fn(Self::Term) -> Result<Term, Self::Error> + 'a {
+        let dataset = self.evaluator.dataset.clone();
+        move |t| dataset.externalize_term(t)
     }
 
     fn now(&mut self) -> DateTime {
         self.evaluator.now
     }
 
-    fn base_iri(&mut self) -> Option<Arc<Iri<String>>> {
-        self.evaluator.base_iri.as_ref().map(Arc::clone)
+    fn base_iri(&mut self) -> Option<Iri<OxString>> {
+        self.evaluator.base_iri.clone()
     }
 
     fn custom_functions(&mut self) -> &CustomFunctionRegistry {
         &self.evaluator.custom_functions
-    }
-}
-
-#[cfg(feature = "sparql-12")]
-type LanguageWithMaybeBaseDirection = (String, Option<BaseDirection>);
-#[cfg(not(feature = "sparql-12"))]
-type LanguageWithMaybeBaseDirection = String;
-
-#[cfg(feature = "sparql-12")]
-fn to_string_and_language(
-    term: ExpressionTerm,
-) -> Option<(String, Option<LanguageWithMaybeBaseDirection>)> {
-    match term {
-        ExpressionTerm::StringLiteral(value) => Some((value, None)),
-        ExpressionTerm::LangStringLiteral { value, language } => {
-            Some((value, Some((language, None))))
-        }
-        ExpressionTerm::DirLangStringLiteral {
-            value,
-            language,
-            direction,
-        } => Some((value, Some((language, Some(direction))))),
-        _ => None,
-    }
-}
-
-#[cfg(not(feature = "sparql-12"))]
-fn to_string_and_language(
-    term: ExpressionTerm,
-) -> Option<(String, Option<LanguageWithMaybeBaseDirection>)> {
-    match term {
-        ExpressionTerm::StringLiteral(value) => Some((value, None)),
-        ExpressionTerm::LangStringLiteral { value, language } => Some((value, Some(language))),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "sparql-12")]
-fn build_plain_literal(
-    value: String,
-    language: Option<LanguageWithMaybeBaseDirection>,
-) -> ExpressionTerm {
-    if let Some((language, direction)) = language {
-        if let Some(direction) = direction {
-            ExpressionTerm::DirLangStringLiteral {
-                value,
-                language,
-                direction,
-            }
-        } else {
-            ExpressionTerm::LangStringLiteral { value, language }
-        }
-    } else {
-        ExpressionTerm::StringLiteral(value)
-    }
-}
-
-#[cfg(not(feature = "sparql-12"))]
-fn build_plain_literal(
-    value: String,
-    language: Option<LanguageWithMaybeBaseDirection>,
-) -> ExpressionTerm {
-    if let Some(language) = language {
-        ExpressionTerm::LangStringLiteral { value, language }
-    } else {
-        ExpressionTerm::StringLiteral(value)
     }
 }
 
@@ -2345,32 +2130,32 @@ enum AccumulatorWrapper<'a, T> {
         count: u64,
     },
     CountInternal {
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<T> + 'a>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, T, QueryEvaluationError>,
         count: u64,
     },
     CountDistinctInternal {
         seen: FxHashSet<T>,
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<T> + 'a>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, T, QueryEvaluationError>,
         count: u64,
     },
     Sample {
         // TODO: add internal variant
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
         value: Option<ExpressionTerm>,
     },
     Expression {
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
         accumulator: Option<Box<dyn Accumulator>>,
     },
     DistinctExpression {
         seen: FxHashSet<ExpressionTerm>,
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
         accumulator: Option<Box<dyn Accumulator>>,
     },
 }
 
 impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
-    fn accumulate(&mut self, tuple: &InternalTuple<T>) {
+    fn accumulate(&mut self, tuple: &InternalTuple<T>) -> Result<(), QueryEvaluationError> {
         match self {
             Self::CountTuple { count } => {
                 *count += 1;
@@ -2381,7 +2166,7 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 }
             }
             Self::CountInternal { evaluator, count } => {
-                if evaluator(tuple).is_some() {
+                if evaluator(tuple)?.is_some() {
                     *count += 1;
                 }
             }
@@ -2390,8 +2175,8 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 evaluator,
                 count,
             } => {
-                let Some(value) = evaluator(tuple) else {
-                    return;
+                let Some(value) = evaluator(tuple)? else {
+                    return Ok(());
                 };
                 if seen.insert(value) {
                     *count += 1;
@@ -2399,23 +2184,23 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
             }
             Self::Sample { evaluator, value } => {
                 if value.is_some() {
-                    return; // We already got a value
+                    return Ok(()); // We already got a value
                 }
-                *value = evaluator(tuple);
+                *value = evaluator(tuple)?;
             }
             Self::Expression {
                 evaluator,
                 accumulator,
             } => {
                 if accumulator.is_none() {
-                    return; // Already failed
+                    return Ok(()); // Already failed
                 }
-                let Some(value) = evaluator(tuple) else {
+                let Some(value) = evaluator(tuple)? else {
                     *accumulator = None;
-                    return;
+                    return Ok(());
                 };
                 let Some(accumulator) = accumulator else {
-                    return;
+                    return Ok(());
                 };
                 accumulator.accumulate(value);
             }
@@ -2425,20 +2210,21 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 accumulator,
             } => {
                 if accumulator.is_none() {
-                    return; // Already failed
+                    return Ok(()); // Already failed
                 }
-                let Some(value) = evaluator(tuple) else {
+                let Some(value) = evaluator(tuple)? else {
                     *accumulator = None;
-                    return;
+                    return Ok(());
                 };
                 let Some(accumulator) = accumulator else {
-                    return;
+                    return Ok(());
                 };
                 if seen.insert(value.clone()) {
                     accumulator.accumulate(value);
                 }
             }
         }
+        Ok(())
     }
 
     fn finish(self) -> Option<ExpressionTerm> {
@@ -2602,10 +2388,9 @@ impl Accumulator for MaxAccumulator {
     }
 }
 
-#[expect(clippy::option_option)]
 struct GroupConcatAccumulator {
     concat: Option<String>,
-    language: Option<Option<LanguageWithMaybeBaseDirection>>,
+    is_continue: bool,
     separator: Rc<str>,
 }
 
@@ -2613,7 +2398,7 @@ impl GroupConcatAccumulator {
     fn new(separator: Rc<str>) -> Self {
         Self {
             concat: Some(String::new()),
-            language: None,
+            is_continue: false,
             separator,
         }
     }
@@ -2624,17 +2409,20 @@ impl Accumulator for GroupConcatAccumulator {
         let Some(concat) = self.concat.as_mut() else {
             return;
         };
-        let Some((value, e_language)) = to_string_and_language(element) else {
-            self.concat = None;
-            return;
-        };
-        if let Some(lang) = &self.language {
-            if *lang != e_language {
-                self.language = Some(None)
+        let value = match element {
+            ExpressionTerm::StringLiteral(value) => value,
+            ExpressionTerm::LangStringLiteral { value, .. } => value,
+            #[cfg(feature = "sparql-12")]
+            ExpressionTerm::DirLangStringLiteral { value, .. } => value,
+            _ => {
+                self.concat = None;
+                return;
             }
+        };
+        if self.is_continue {
             concat.push_str(&self.separator);
         } else {
-            self.language = Some(e_language)
+            self.is_continue = true;
         }
         concat.push_str(&value);
     }
@@ -2642,7 +2430,7 @@ impl Accumulator for GroupConcatAccumulator {
     fn finish(&mut self) -> Option<ExpressionTerm> {
         self.concat
             .take()
-            .map(|result| build_plain_literal(result, self.language.take().flatten()))
+            .map(|result| ExpressionTerm::StringLiteral(OxString::new_owned(&result)))
     }
 }
 
@@ -2966,7 +2754,7 @@ struct PathEvaluator<'a, D: QueryableDataset<'a>> {
 }
 
 impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
-    fn eval_closed_in_graph(
+    fn eval_closed(
         &self,
         path: &PropertyPath<D::InternalTerm>,
         start: &D::InternalTerm,
@@ -2980,46 +2768,44 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                 .next()
                 .transpose()?
                 .is_some(),
-            PropertyPath::Reverse(p) => self.eval_closed_in_graph(p, end, start, graph_name)?,
+            PropertyPath::Reverse(p) => self.eval_closed(p, end, start, graph_name)?,
             PropertyPath::Sequence(a, b) => self
-                .eval_from_in_graph(a, start, graph_name)
+                .eval_from(a, start, graph_name)
                 .find_map(|middle| {
                     middle
                         .and_then(|middle| {
-                            Ok(self
-                                .eval_closed_in_graph(b, &middle, end, graph_name)?
-                                .then_some(()))
+                            Ok(self.eval_closed(b, &middle, end, graph_name)?.then_some(()))
                         })
                         .transpose()
                 })
                 .transpose()?
                 .is_some(),
             PropertyPath::Alternative(a, b) => {
-                self.eval_closed_in_graph(a, start, end, graph_name)?
-                    || self.eval_closed_in_graph(b, start, end, graph_name)?
+                self.eval_closed(a, start, end, graph_name)?
+                    || self.eval_closed(b, start, end, graph_name)?
             }
             PropertyPath::ZeroOrMore(p) => {
                 if start == end {
-                    self.is_subject_or_object_in_graph(start, graph_name)?
+                    true
                 } else {
                     look_in_transitive_closure(
-                        self.eval_from_in_graph(p, start, graph_name),
-                        move |e| self.eval_from_in_graph(p, &e, graph_name),
+                        self.eval_from(p, start, graph_name),
+                        move |e| self.eval_from(p, &e, graph_name),
                         end,
                     )?
                 }
             }
             PropertyPath::OneOrMore(p) => look_in_transitive_closure(
-                self.eval_from_in_graph(p, start, graph_name),
-                move |e| self.eval_from_in_graph(p, &e, graph_name),
+                self.eval_from(p, start, graph_name),
+                move |e| self.eval_from(p, &e, graph_name),
                 end,
             )?,
             PropertyPath::ZeroOrOne(p) => {
                 if start == end {
-                    self.is_subject_or_object_in_graph(start, graph_name)
+                    true
                 } else {
-                    self.eval_closed_in_graph(p, start, end, graph_name)
-                }?
+                    self.eval_closed(p, start, end, graph_name)?
+                }
             }
             PropertyPath::NegatedPropertySet(ps) => self
                 .dataset
@@ -3039,105 +2825,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         })
     }
 
-    fn eval_closed_in_unknown_graph(
-        &self,
-        path: &PropertyPath<D::InternalTerm>,
-        start: &D::InternalTerm,
-        end: &D::InternalTerm,
-    ) -> Box<dyn Iterator<Item = Result<Option<D::InternalTerm>, QueryEvaluationError>> + 'a> {
-        match path {
-            PropertyPath::Path(p) => Box::new(
-                self.dataset
-                    .internal_quads_for_pattern(Some(start), Some(p), Some(end), None)
-                    .map(|t| Ok(t?.graph_name)),
-            ),
-            PropertyPath::Reverse(p) => self.eval_closed_in_unknown_graph(p, end, start),
-            PropertyPath::Sequence(a, b) => {
-                let eval = self.clone();
-                let b = Rc::clone(b);
-                let end = end.clone();
-                Box::new(self.eval_from_in_unknown_graph(a, start).flat_map_ok(
-                    move |(middle, graph_name)| {
-                        eval.eval_closed_in_graph(&b, &middle, &end, graph_name.as_ref())
-                            .map(|is_found| is_found.then_some(graph_name))
-                            .transpose()
-                    },
-                ))
-            }
-            PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_closed_in_unknown_graph(a, start, end)
-                    .chain(self.eval_closed_in_unknown_graph(b, start, end)),
-            )),
-            PropertyPath::ZeroOrMore(p) => {
-                let eval = self.clone();
-                let start2 = start.clone();
-                let end = end.clone();
-                let p = Rc::clone(p);
-                self.run_if_term_is_a_dataset_node(start, move |graph_name| {
-                    look_in_transitive_closure(
-                        Some(Ok(start2.clone())),
-                        |e| eval.eval_from_in_graph(&p, &e, graph_name.as_ref()),
-                        &end,
-                    )
-                    .map(|is_found| is_found.then_some(graph_name))
-                    .transpose()
-                })
-            }
-            PropertyPath::OneOrMore(p) => {
-                let eval = self.clone();
-                let end = end.clone();
-                let p = Rc::clone(p);
-                Box::new(
-                    self.eval_from_in_unknown_graph(&p, start)
-                        .filter_map(move |r| {
-                            r.and_then(|(start, graph_name)| {
-                                look_in_transitive_closure(
-                                    Some(Ok(start)),
-                                    |e| eval.eval_from_in_graph(&p, &e, graph_name.as_ref()),
-                                    &end,
-                                )
-                                .map(|is_found| is_found.then_some(graph_name))
-                            })
-                            .transpose()
-                        }),
-                )
-            }
-            PropertyPath::ZeroOrOne(p) => {
-                if start == end {
-                    self.run_if_term_is_a_dataset_node(start, |graph_name| Some(Ok(graph_name)))
-                } else {
-                    let eval = self.clone();
-                    let start2 = start.clone();
-                    let end = end.clone();
-                    let p = Rc::clone(p);
-                    self.run_if_term_is_a_dataset_node(start, move |graph_name| {
-                        eval.eval_closed_in_graph(&p, &start2, &end, graph_name.as_ref())
-                            .map(|is_found| is_found.then_some(graph_name))
-                            .transpose()
-                    })
-                }
-            }
-            PropertyPath::NegatedPropertySet(ps) => {
-                let ps = Rc::clone(ps);
-                Box::new(
-                    self.dataset
-                        .internal_quads_for_pattern(Some(start), None, Some(end), None)
-                        .filter_map(move |t| match t {
-                            Ok(t) => {
-                                if ps.contains(&t.predicate) {
-                                    None
-                                } else {
-                                    Some(Ok(t.graph_name))
-                                }
-                            }
-                            Err(e) => Some(Err(e)),
-                        }),
-                )
-            }
-        }
-    }
-
-    fn eval_from_in_graph(
+    fn eval_from(
         &self,
         path: &PropertyPath<D::InternalTerm>,
         start: &D::InternalTerm,
@@ -3149,49 +2837,42 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     .internal_quads_for_pattern(Some(start), Some(p), None, Some(graph_name))
                     .map(|t| Ok(t?.object)),
             ),
-            PropertyPath::Reverse(p) => self.eval_to_in_graph(p, start, graph_name),
+            PropertyPath::Reverse(p) => self.eval_to(p, start, graph_name),
             PropertyPath::Sequence(a, b) => {
                 let eval = self.clone();
                 let b = Rc::clone(b);
                 let graph_name2 = graph_name.cloned();
                 Box::new(
-                    self.eval_from_in_graph(a, start, graph_name)
+                    self.eval_from(a, start, graph_name)
                         .flat_map_ok(move |middle| {
-                            eval.eval_from_in_graph(&b, &middle, graph_name2.as_ref())
+                            eval.eval_from(&b, &middle, graph_name2.as_ref())
                         }),
                 )
             }
             PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_from_in_graph(a, start, graph_name)
-                    .chain(self.eval_from_in_graph(b, start, graph_name)),
+                self.eval_from(a, start, graph_name)
+                    .chain(self.eval_from(b, start, graph_name)),
             )),
             PropertyPath::ZeroOrMore(p) => {
-                self.run_if_term_is_a_graph_node(start, graph_name, || {
-                    let eval = self.clone();
-                    let p = Rc::clone(p);
-                    let graph_name2 = graph_name.cloned();
-                    transitive_closure(Some(Ok(start.clone())), move |e| {
-                        eval.eval_from_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                })
+                let eval = self.clone();
+                let p = Rc::clone(p);
+                let graph_name2 = graph_name.cloned();
+                Box::new(transitive_closure(Some(Ok(start.clone())), move |e| {
+                    eval.eval_from(&p, &e, graph_name2.as_ref())
+                }))
             }
             PropertyPath::OneOrMore(p) => {
                 let eval = self.clone();
                 let p = Rc::clone(p);
                 let graph_name2 = graph_name.cloned();
                 Box::new(transitive_closure(
-                    self.eval_from_in_graph(&p, start, graph_name),
-                    move |e| eval.eval_from_in_graph(&p, &e, graph_name2.as_ref()),
+                    self.eval_from(&p, start, graph_name),
+                    move |e| eval.eval_from(&p, &e, graph_name2.as_ref()),
                 ))
             }
-            PropertyPath::ZeroOrOne(p) => {
-                self.run_if_term_is_a_graph_node(start, graph_name, || {
-                    hash_deduplicate(
-                        once(Ok(start.clone()))
-                            .chain(self.eval_from_in_graph(p, start, graph_name)),
-                    )
-                })
-            }
+            PropertyPath::ZeroOrOne(p) => Box::new(hash_deduplicate(
+                once(Ok(start.clone())).chain(self.eval_from(p, start, graph_name)),
+            )),
             PropertyPath::NegatedPropertySet(ps) => {
                 let ps = Rc::clone(ps);
                 Box::new(
@@ -3212,98 +2893,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         }
     }
 
-    fn eval_from_in_unknown_graph(
-        &self,
-        path: &PropertyPath<D::InternalTerm>,
-        start: &D::InternalTerm,
-    ) -> Box<
-        dyn Iterator<
-                Item = Result<(D::InternalTerm, Option<D::InternalTerm>), QueryEvaluationError>,
-            > + 'a,
-    > {
-        match path {
-            PropertyPath::Path(p) => Box::new(
-                self.dataset
-                    .internal_quads_for_pattern(Some(start), Some(p), None, None)
-                    .map(|t| {
-                        let t = t?;
-                        Ok((t.object, t.graph_name))
-                    }),
-            ),
-            PropertyPath::Reverse(p) => self.eval_to_in_unknown_graph(p, start),
-            PropertyPath::Sequence(a, b) => {
-                let eval = self.clone();
-                let b = Rc::clone(b);
-                Box::new(self.eval_from_in_unknown_graph(a, start).flat_map_ok(
-                    move |(middle, graph_name)| {
-                        eval.eval_from_in_graph(&b, &middle, graph_name.as_ref())
-                            .map(move |end| Ok((end?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_from_in_unknown_graph(a, start)
-                    .chain(self.eval_from_in_unknown_graph(b, start)),
-            )),
-            PropertyPath::ZeroOrMore(p) => {
-                let start2 = start.clone();
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                self.run_if_term_is_a_dataset_node(start, move |graph_name| {
-                    let eval = eval.clone();
-                    let p = Rc::clone(&p);
-                    let graph_name2 = graph_name.clone();
-                    transitive_closure(Some(Ok(start2.clone())), move |e| {
-                        eval.eval_from_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                    .map(move |e| Ok((e?, graph_name.clone())))
-                })
-            }
-            PropertyPath::OneOrMore(p) => {
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                Box::new(transitive_closure(
-                    self.eval_from_in_unknown_graph(&p, start),
-                    move |(e, graph_name)| {
-                        eval.eval_from_in_graph(&p, &e, graph_name.as_ref())
-                            .map(move |e| Ok((e?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::ZeroOrOne(p) => {
-                let eval = self.clone();
-                let start2 = start.clone();
-                let p = Rc::clone(p);
-                self.run_if_term_is_a_dataset_node(start, move |graph_name| {
-                    hash_deduplicate(once(Ok(start2.clone())).chain(eval.eval_from_in_graph(
-                        &p,
-                        &start2,
-                        graph_name.as_ref(),
-                    )))
-                    .map(move |e| Ok((e?, graph_name.clone())))
-                })
-            }
-            PropertyPath::NegatedPropertySet(ps) => {
-                let ps = Rc::clone(ps);
-                Box::new(
-                    self.dataset
-                        .internal_quads_for_pattern(Some(start), None, None, None)
-                        .filter_map(move |t| match t {
-                            Ok(t) => {
-                                if ps.contains(&t.predicate) {
-                                    None
-                                } else {
-                                    Some(Ok((t.object, t.graph_name)))
-                                }
-                            }
-                            Err(e) => Some(Err(e)),
-                        }),
-                )
-            }
-        }
-    }
-
-    fn eval_to_in_graph(
+    fn eval_to(
         &self,
         path: &PropertyPath<D::InternalTerm>,
         end: &D::InternalTerm,
@@ -3315,46 +2905,40 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     .internal_quads_for_pattern(None, Some(p), Some(end), Some(graph_name))
                     .map(|t| Ok(t?.subject)),
             ),
-            PropertyPath::Reverse(p) => self.eval_from_in_graph(p, end, graph_name),
+            PropertyPath::Reverse(p) => self.eval_from(p, end, graph_name),
             PropertyPath::Sequence(a, b) => {
                 let eval = self.clone();
                 let a = Rc::clone(a);
                 let graph_name2 = graph_name.cloned();
                 Box::new(
-                    self.eval_to_in_graph(b, end, graph_name)
-                        .flat_map_ok(move |middle| {
-                            eval.eval_to_in_graph(&a, &middle, graph_name2.as_ref())
-                        }),
+                    self.eval_to(b, end, graph_name)
+                        .flat_map_ok(move |middle| eval.eval_to(&a, &middle, graph_name2.as_ref())),
                 )
             }
             PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_to_in_graph(a, end, graph_name)
-                    .chain(self.eval_to_in_graph(b, end, graph_name)),
+                self.eval_to(a, end, graph_name)
+                    .chain(self.eval_to(b, end, graph_name)),
             )),
             PropertyPath::ZeroOrMore(p) => {
-                self.run_if_term_is_a_graph_node(end, graph_name, || {
-                    let eval = self.clone();
-                    let p = Rc::clone(p);
-                    let graph_name2 = graph_name.cloned();
-                    transitive_closure(Some(Ok(end.clone())), move |e| {
-                        eval.eval_to_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                })
+                let eval = self.clone();
+                let p = Rc::clone(p);
+                let graph_name2 = graph_name.cloned();
+                Box::new(transitive_closure(Some(Ok(end.clone())), move |e| {
+                    eval.eval_to(&p, &e, graph_name2.as_ref())
+                }))
             }
             PropertyPath::OneOrMore(p) => {
                 let eval = self.clone();
                 let p = Rc::clone(p);
                 let graph_name2 = graph_name.cloned();
                 Box::new(transitive_closure(
-                    self.eval_to_in_graph(&p, end, graph_name),
-                    move |e| eval.eval_to_in_graph(&p, &e, graph_name2.as_ref()),
+                    self.eval_to(&p, end, graph_name),
+                    move |e| eval.eval_to(&p, &e, graph_name2.as_ref()),
                 ))
             }
-            PropertyPath::ZeroOrOne(p) => self.run_if_term_is_a_graph_node(end, graph_name, || {
-                hash_deduplicate(
-                    once(Ok(end.clone())).chain(self.eval_to_in_graph(p, end, graph_name)),
-                )
-            }),
+            PropertyPath::ZeroOrOne(p) => Box::new(hash_deduplicate(
+                once(Ok(end.clone())).chain(self.eval_to(p, end, graph_name)),
+            )),
             PropertyPath::NegatedPropertySet(ps) => {
                 let ps = Rc::clone(ps);
                 Box::new(
@@ -3375,98 +2959,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         }
     }
 
-    fn eval_to_in_unknown_graph(
-        &self,
-        path: &PropertyPath<D::InternalTerm>,
-        end: &D::InternalTerm,
-    ) -> Box<
-        dyn Iterator<
-                Item = Result<(D::InternalTerm, Option<D::InternalTerm>), QueryEvaluationError>,
-            > + 'a,
-    > {
-        match path {
-            PropertyPath::Path(p) => Box::new(
-                self.dataset
-                    .internal_quads_for_pattern(None, Some(p), Some(end), None)
-                    .map(|t| {
-                        let t = t?;
-                        Ok((t.subject, t.graph_name))
-                    }),
-            ),
-            PropertyPath::Reverse(p) => self.eval_from_in_unknown_graph(p, end),
-            PropertyPath::Sequence(a, b) => {
-                let eval = self.clone();
-                let a = Rc::clone(a);
-                Box::new(self.eval_to_in_unknown_graph(b, end).flat_map_ok(
-                    move |(middle, graph_name)| {
-                        eval.eval_to_in_graph(&a, &middle, graph_name.as_ref())
-                            .map(move |start| Ok((start?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_to_in_unknown_graph(a, end)
-                    .chain(self.eval_to_in_unknown_graph(b, end)),
-            )),
-            PropertyPath::ZeroOrMore(p) => {
-                let end2 = end.clone();
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                self.run_if_term_is_a_dataset_node(end, move |graph_name| {
-                    let eval = eval.clone();
-                    let p = Rc::clone(&p);
-                    let graph_name2 = graph_name.clone();
-                    transitive_closure(Some(Ok(end2.clone())), move |e| {
-                        eval.eval_to_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                    .map(move |e| Ok((e?, graph_name.clone())))
-                })
-            }
-            PropertyPath::OneOrMore(p) => {
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                Box::new(transitive_closure(
-                    self.eval_to_in_unknown_graph(&p, end),
-                    move |(e, graph_name)| {
-                        eval.eval_to_in_graph(&p, &e, graph_name.as_ref())
-                            .map(move |e| Ok((e?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::ZeroOrOne(p) => {
-                let eval = self.clone();
-                let end2 = end.clone();
-                let p = Rc::clone(p);
-                self.run_if_term_is_a_dataset_node(end, move |graph_name| {
-                    hash_deduplicate(once(Ok(end2.clone())).chain(eval.eval_to_in_graph(
-                        &p,
-                        &end2,
-                        graph_name.as_ref(),
-                    )))
-                    .map(move |e| Ok((e?, graph_name.clone())))
-                })
-            }
-            PropertyPath::NegatedPropertySet(ps) => {
-                let ps = Rc::clone(ps);
-                Box::new(
-                    self.dataset
-                        .internal_quads_for_pattern(None, None, Some(end), None)
-                        .filter_map(move |t| match t {
-                            Ok(t) => {
-                                if ps.contains(&t.predicate) {
-                                    None
-                                } else {
-                                    Some(Ok((t.subject, t.graph_name)))
-                                }
-                            }
-                            Err(e) => Some(Err(e)),
-                        }),
-                )
-            }
-        }
-    }
-
-    fn eval_open_in_graph(
+    fn eval_open(
         &self,
         path: &PropertyPath<D::InternalTerm>,
         graph_name: Option<&D::InternalTerm>,
@@ -3483,32 +2976,33 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     }),
             ),
             PropertyPath::Reverse(p) => Box::new(
-                self.eval_open_in_graph(p, graph_name)
+                self.eval_open(p, graph_name)
                     .map(|t| t.map(|(s, o)| (o, s))),
             ),
             PropertyPath::Sequence(a, b) => {
                 let eval = self.clone();
                 let b = Rc::clone(b);
                 let graph_name2 = graph_name.cloned();
-                Box::new(self.eval_open_in_graph(a, graph_name).flat_map_ok(
-                    move |(start, middle)| {
-                        eval.eval_from_in_graph(&b, &middle, graph_name2.as_ref())
-                            .map(move |end| Ok((start.clone(), end?)))
-                    },
-                ))
+                Box::new(
+                    self.eval_open(a, graph_name)
+                        .flat_map_ok(move |(start, middle)| {
+                            eval.eval_from(&b, &middle, graph_name2.as_ref())
+                                .map(move |end| Ok((start.clone(), end?)))
+                        }),
+                )
             }
             PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_open_in_graph(a, graph_name)
-                    .chain(self.eval_open_in_graph(b, graph_name)),
+                self.eval_open(a, graph_name)
+                    .chain(self.eval_open(b, graph_name)),
             )),
             PropertyPath::ZeroOrMore(p) => {
                 let eval = self.clone();
                 let p = Rc::clone(p);
                 let graph_name2 = graph_name.cloned();
                 Box::new(transitive_closure(
-                    self.get_subject_or_object_identity_pairs_in_graph(graph_name),
+                    self.get_subject_or_object_identity_pairs(graph_name),
                     move |(start, middle)| {
-                        eval.eval_from_in_graph(&p, &middle, graph_name2.as_ref())
+                        eval.eval_from(&p, &middle, graph_name2.as_ref())
                             .map(move |end| Ok((start.clone(), end?)))
                     },
                 ))
@@ -3518,16 +3012,16 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                 let p = Rc::clone(p);
                 let graph_name2 = graph_name.cloned();
                 Box::new(transitive_closure(
-                    self.eval_open_in_graph(&p, graph_name),
+                    self.eval_open(&p, graph_name),
                     move |(start, middle)| {
-                        eval.eval_from_in_graph(&p, &middle, graph_name2.as_ref())
+                        eval.eval_from(&p, &middle, graph_name2.as_ref())
                             .map(move |end| Ok((start.clone(), end?)))
                     },
                 ))
             }
             PropertyPath::ZeroOrOne(p) => Box::new(hash_deduplicate(
-                self.get_subject_or_object_identity_pairs_in_graph(graph_name)
-                    .chain(self.eval_open_in_graph(p, graph_name)),
+                self.get_subject_or_object_identity_pairs(graph_name)
+                    .chain(self.eval_open(p, graph_name)),
             )),
             PropertyPath::NegatedPropertySet(ps) => {
                 let ps = Rc::clone(ps);
@@ -3549,91 +3043,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         }
     }
 
-    fn eval_open_in_unknown_graph(
-        &self,
-        path: &PropertyPath<D::InternalTerm>,
-    ) -> Box<
-        dyn Iterator<
-                Item = Result<
-                    (D::InternalTerm, D::InternalTerm, Option<D::InternalTerm>),
-                    QueryEvaluationError,
-                >,
-            > + 'a,
-    > {
-        match path {
-            PropertyPath::Path(p) => Box::new(
-                self.dataset
-                    .internal_quads_for_pattern(None, Some(p), None, None)
-                    .map(|t| {
-                        let t = t?;
-                        Ok((t.subject, t.object, t.graph_name))
-                    }),
-            ),
-            PropertyPath::Reverse(p) => Box::new(
-                self.eval_open_in_unknown_graph(p)
-                    .map(|t| t.map(|(s, o, g)| (o, s, g))),
-            ),
-            PropertyPath::Sequence(a, b) => {
-                let eval = self.clone();
-                let b = Rc::clone(b);
-                Box::new(self.eval_open_in_unknown_graph(a).flat_map_ok(
-                    move |(start, middle, graph_name)| {
-                        eval.eval_from_in_graph(&b, &middle, graph_name.as_ref())
-                            .map(move |end| Ok((start.clone(), end?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::Alternative(a, b) => Box::new(hash_deduplicate(
-                self.eval_open_in_unknown_graph(a)
-                    .chain(self.eval_open_in_unknown_graph(b)),
-            )),
-            PropertyPath::ZeroOrMore(p) => {
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                Box::new(transitive_closure(
-                    self.get_subject_or_object_identity_pairs_in_dataset(),
-                    move |(start, middle, graph_name)| {
-                        eval.eval_from_in_graph(&p, &middle, graph_name.as_ref())
-                            .map(move |end| Ok((start.clone(), end?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::OneOrMore(p) => {
-                let eval = self.clone();
-                let p = Rc::clone(p);
-                Box::new(transitive_closure(
-                    self.eval_open_in_unknown_graph(&p),
-                    move |(start, middle, graph_name)| {
-                        eval.eval_from_in_graph(&p, &middle, graph_name.as_ref())
-                            .map(move |end| Ok((start.clone(), end?, graph_name.clone())))
-                    },
-                ))
-            }
-            PropertyPath::ZeroOrOne(p) => Box::new(hash_deduplicate(
-                self.get_subject_or_object_identity_pairs_in_dataset()
-                    .chain(self.eval_open_in_unknown_graph(p)),
-            )),
-            PropertyPath::NegatedPropertySet(ps) => {
-                let ps = Rc::clone(ps);
-                Box::new(
-                    self.dataset
-                        .internal_quads_for_pattern(None, None, None, None)
-                        .filter_map(move |t| match t {
-                            Ok(t) => {
-                                if ps.contains(&t.predicate) {
-                                    None
-                                } else {
-                                    Some(Ok((t.subject, t.object, t.graph_name)))
-                                }
-                            }
-                            Err(e) => Some(Err(e)),
-                        }),
-                )
-            }
-        }
-    }
-
-    fn get_subject_or_object_identity_pairs_in_graph(
+    fn get_subject_or_object_identity_pairs(
         &self,
         graph_name: Option<&D::InternalTerm>,
     ) -> impl Iterator<Item = Result<(D::InternalTerm, D::InternalTerm), QueryEvaluationError>>
@@ -3646,92 +3056,6 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     Ok((t.object.clone(), t.object)),
                 ]
             })
-    }
-
-    fn get_subject_or_object_identity_pairs_in_dataset(
-        &self,
-    ) -> impl Iterator<
-        Item = Result<
-            (D::InternalTerm, D::InternalTerm, Option<D::InternalTerm>),
-            QueryEvaluationError,
-        >,
-    > + use<'a, D> {
-        self.dataset
-            .internal_quads_for_pattern(None, None, None, None)
-            .flat_map_ok(|t| {
-                [
-                    Ok((t.subject.clone(), t.subject, t.graph_name.clone())),
-                    Ok((t.object.clone(), t.object, t.graph_name)),
-                ]
-            })
-    }
-
-    fn run_if_term_is_a_graph_node<
-        T: 'a,
-        I: Iterator<Item = Result<T, QueryEvaluationError>> + 'a,
-    >(
-        &self,
-        term: &D::InternalTerm,
-        graph_name: Option<&D::InternalTerm>,
-        f: impl FnOnce() -> I,
-    ) -> Box<dyn Iterator<Item = Result<T, QueryEvaluationError>> + 'a> {
-        match self.is_subject_or_object_in_graph(term, graph_name) {
-            Ok(true) => Box::new(f()),
-            Ok(false) => {
-                Box::new(empty()) // Not in the database
-            }
-            Err(error) => Box::new(once(Err(error))),
-        }
-    }
-
-    fn is_subject_or_object_in_graph(
-        &self,
-        term: &D::InternalTerm,
-        graph_name: Option<&D::InternalTerm>,
-    ) -> Result<bool, QueryEvaluationError> {
-        Ok(self
-            .dataset
-            .internal_quads_for_pattern(Some(term), None, None, Some(graph_name))
-            .next()
-            .transpose()?
-            .is_some()
-            || self
-                .dataset
-                .internal_quads_for_pattern(None, None, Some(term), Some(graph_name))
-                .next()
-                .transpose()?
-                .is_some())
-    }
-
-    fn run_if_term_is_a_dataset_node<
-        T: 'a,
-        I: IntoIterator<Item = Result<T, QueryEvaluationError>> + 'a,
-    >(
-        &self,
-        term: &D::InternalTerm,
-        f: impl FnMut(Option<D::InternalTerm>) -> I + 'a,
-    ) -> Box<dyn Iterator<Item = Result<T, QueryEvaluationError>> + 'a> {
-        match self
-            .find_graphs_where_the_node_is_in(term)
-            .collect::<Result<FxHashSet<_>, _>>()
-        {
-            Ok(graph_names) => Box::new(graph_names.into_iter().flat_map(f)),
-            Err(error) => Box::new(once(Err(error))),
-        }
-    }
-
-    fn find_graphs_where_the_node_is_in(
-        &self,
-        term: &D::InternalTerm,
-    ) -> impl Iterator<Item = Result<Option<D::InternalTerm>, QueryEvaluationError>> + use<'a, D>
-    {
-        self.dataset
-            .internal_quads_for_pattern(Some(term), None, None, None)
-            .chain(
-                self.dataset
-                    .internal_quads_for_pattern(None, None, Some(term), None),
-            )
-            .map(|q| Ok(q?.graph_name))
     }
 }
 
@@ -3820,7 +3144,7 @@ struct HashLeftJoinIterator<'a, T> {
     left_iter: InternalTuplesIterator<'a, T>,
     right: InternalTupleSet<T>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
-    expression: Rc<dyn Fn(&InternalTuple<T>) -> Option<bool> + 'a>,
+    expression: Rc<dyn Fn(&InternalTuple<T>) -> Result<Option<bool>, QueryEvaluationError> + 'a>,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
@@ -3835,14 +3159,18 @@ impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
                 Ok(left_tuple) => left_tuple,
                 Err(error) => return Some(Err(error)),
             };
-            self.buffered_results.extend(
-                self.right
-                    .get(&left_tuple)
-                    .iter()
-                    .filter_map(|right_tuple| left_tuple.combine_with(right_tuple))
-                    .filter(|tuple| (self.expression)(tuple).unwrap_or(false))
-                    .map(Ok),
-            );
+            for tuple in self
+                .right
+                .get(&left_tuple)
+                .iter()
+                .filter_map(|right_tuple| left_tuple.combine_with(right_tuple))
+            {
+                match (self.expression)(&tuple) {
+                    Ok(Some(true)) => self.buffered_results.push(Ok(tuple)),
+                    Ok(Some(false) | None) => {}
+                    Err(error) => self.buffered_results.push(Err(error)),
+                }
+            }
             if self.buffered_results.is_empty() {
                 // We have not manage to join with anything
                 return Some(Ok(left_tuple));
@@ -4497,13 +3825,12 @@ fn eval_node_label(node: &GraphPattern) -> String {
             ..
         } => format!(
             "Extend({} -> {variable})",
-            spargebra::algebra::Expression::from(expression)
+            FormattableExpression(expression)
         ),
-        GraphPattern::Filter { expression, .. } => format!(
-            "Filter({})",
-            spargebra::algebra::Expression::from(expression)
-        ),
-        GraphPattern::Graph { graph_name } => format!("Graph({graph_name})"),
+        GraphPattern::Filter { expression, .. } => {
+            format!("Filter({})", FormattableExpression(expression))
+        }
+        GraphPattern::Graph { graph_name, .. } => format!("Graph({graph_name})"),
         GraphPattern::Group {
             variables,
             aggregates,
@@ -4537,7 +3864,7 @@ fn eval_node_label(node: &GraphPattern) -> String {
                     // We are in a ForLoopLeftJoin
                     return format!(
                         "ForLoopLeftJoin(expression = {})",
-                        spargebra::algebra::Expression::from(expression)
+                        FormattableExpression(expression)
                     );
                 }
             }
@@ -4551,7 +3878,7 @@ fn eval_node_label(node: &GraphPattern) -> String {
             LeftJoinAlgorithm::HashBuildRightProbeLeft { keys } => format!(
                 "LeftJoin(HashBuildRightProbeLeft, keys = {}, expression = {})",
                 format_list(keys),
-                spargebra::algebra::Expression::from(expression)
+                FormattableExpression(expression)
             ),
         },
         GraphPattern::Minus { algorithm, .. } => match algorithm {
@@ -4574,17 +3901,8 @@ fn eval_node_label(node: &GraphPattern) -> String {
             subject,
             path,
             object,
-            graph_name,
-        } => {
-            if let Some(graph_name) = graph_name {
-                format!("Path({subject} {path} {object} {graph_name})")
-            } else {
-                format!("Path({subject} {path} {object})")
-            }
-        }
-        GraphPattern::Project { variables, .. } => {
-            format!("Project({})", format_list(variables))
-        }
+        } => format!("Path({subject} {path} {object})"),
+        GraphPattern::Project { variables, .. } => format!("Project({})", format_list(variables)),
         GraphPattern::QuadPattern {
             subject,
             predicate,
@@ -4631,6 +3949,17 @@ fn eval_node_label(node: &GraphPattern) -> String {
                 }))
             )
         }
+    }
+}
+
+struct FormattableExpression<'a>(&'a Expression);
+
+impl fmt::Display for FormattableExpression<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if spargebra::algebra::Expression::from(self.0).fmt(f).is_err() {
+            f.write_char('?')?;
+        }
+        Ok(())
     }
 }
 

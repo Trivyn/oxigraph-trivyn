@@ -1,5 +1,3 @@
-#![allow(clippy::print_stderr)]
-
 use codspeed_criterion_compat::{Criterion, Throughput, criterion_group, criterion_main};
 use oxigraph::io::{JsonLdProfile, JsonLdProfileSet, RdfFormat, RdfParser};
 use oxigraph_testsuite::files::read_file;
@@ -185,7 +183,7 @@ fn canonicalization_test_data_from_testsuite() -> Dataset {
                 .rename_blank_nodes()
                 .for_reader(read_file(&test.action.unwrap()).unwrap())
             {
-                dataset.insert(&q.unwrap());
+                dataset.insert(q.unwrap());
             }
         }
     }

@@ -5,18 +5,22 @@ use oxiri::{Iri, IriParseError};
 #[cfg(feature = "rdf-12")]
 use oxrdf::BaseDirection;
 use oxrdf::vocab::rdf;
-use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
-use quick_xml::escape::{resolve_xml_entity, unescape_with};
+use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, OxString, Term, Triple};
+use quick_xml::escape::{EscapeError, resolve_xml_entity, unescape_with};
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::*;
-use quick_xml::name::{LocalName, Namespace, PrefixDeclaration, PrefixIter, ResolveResult};
-use quick_xml::{Decoder, Error, NsReader, Writer};
+use quick_xml::name::{
+    LocalName, Namespace, NamespaceBindingsIter, PrefixDeclaration, ResolveResult,
+};
+use quick_xml::{Decoder, Error, NsReader, Writer, XmlVersion};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::str;
 #[cfg(feature = "async-tokio")]
 use tokio::io::{AsyncRead, BufReader as AsyncBufReader};
+
+const MAX_ENTITY_NESTING: usize = 1024;
 
 /// A [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) streaming parser.
 ///
@@ -29,7 +33,7 @@ use tokio::io::{AsyncRead, BufReader as AsyncBufReader};
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxrdfxml::RdfXmlParser;
 ///
@@ -42,11 +46,11 @@ use tokio::io::{AsyncRead, BufReader as AsyncBufReader};
 ///  <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
 /// </rdf:RDF>"#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in RdfXmlParser::new().for_reader(file.as_bytes()) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -57,7 +61,7 @@ use tokio::io::{AsyncRead, BufReader as AsyncBufReader};
 #[must_use]
 pub struct RdfXmlParser {
     lenient: bool,
-    base: Option<Iri<String>>,
+    base: Option<Iri<OxString>>,
 }
 
 impl RdfXmlParser {
@@ -79,16 +83,16 @@ impl RdfXmlParser {
     }
 
     #[inline]
-    pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
-        self.base = Some(Iri::parse(base_iri.into())?);
+    pub fn with_base_iri(mut self, base_iri: &str) -> Result<Self, IriParseError> {
+        self.base = Some(Iri::parse(OxString::new_owned(base_iri))?);
         Ok(self)
     }
 
-    /// Parses a RDF/XML file from a [`Read`] implementation.
+    /// Parses an RDF/XML file from a [`Read`] implementation.
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxrdfxml::RdfXmlParser;
     ///
@@ -101,11 +105,11 @@ impl RdfXmlParser {
     ///  <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
     /// </rdf:RDF>"#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// for triple in RdfXmlParser::new().for_reader(file.as_bytes()) {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -116,17 +120,17 @@ impl RdfXmlParser {
         ReaderRdfXmlParser {
             results: Vec::new(),
             parser: self.into_internal(BufReader::new(reader)),
-            reader_buffer: Vec::default(),
+            reader_buffer: Vec::new(),
         }
     }
 
-    /// Parses a RDF/XML file from a [`AsyncRead`] implementation.
+    /// Parses an RDF/XML file from a [`AsyncRead`] implementation.
     ///
     /// Count the number of people:
     /// ```
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxrdfxml::RdfXmlParser;
     ///
@@ -139,12 +143,12 @@ impl RdfXmlParser {
     ///   <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
     /// </rdf:RDF>"#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// let mut parser = RdfXmlParser::new().for_tokio_async_reader(file.as_bytes());
     /// while let Some(triple) = parser.next().await {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -160,15 +164,15 @@ impl RdfXmlParser {
         TokioAsyncReaderRdfXmlParser {
             results: Vec::new(),
             parser: self.into_internal(AsyncBufReader::new(reader)),
-            reader_buffer: Vec::default(),
+            reader_buffer: Vec::new(),
         }
     }
 
-    /// Parses a RDF/XML file from a byte slice.
+    /// Parses an RDF/XML file from a byte slice.
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxrdfxml::RdfXmlParser;
     ///
@@ -181,11 +185,11 @@ impl RdfXmlParser {
     ///  <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
     /// </rdf:RDF>"#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// for triple in RdfXmlParser::new().for_slice(file) {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -207,22 +211,24 @@ impl RdfXmlParser {
             state: vec![RdfXmlState::Doc {
                 base_iri: self.base.clone(),
             }],
-            custom_entities: HashMap::new(),
+            custom_entities: EntityRegistry::default(),
             in_literal_depth: 0,
-            known_rdf_id: HashSet::default(),
+            known_rdf_id: HashSet::new(),
             is_end: false,
             lenient: self.lenient,
+            xml_version: XmlVersion::Implicit1_0,
+            text_buffer: String::new(),
         }
     }
 }
 
-/// Parses a RDF/XML file from a [`Read`] implementation.
+/// Parses an RDF/XML file from a [`Read`] implementation.
 ///
 /// Can be built using [`RdfXmlParser::for_reader`].
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxrdfxml::RdfXmlParser;
 ///
@@ -235,11 +241,11 @@ impl RdfXmlParser {
 ///  <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
 /// </rdf:RDF>"#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in RdfXmlParser::new().for_reader(file.as_bytes()) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -305,7 +311,8 @@ impl<R: Read> ReaderRdfXmlParser<R> {
     /// ```
     pub fn prefixes(&self) -> RdfXmlPrefixesIter<'_> {
         RdfXmlPrefixesIter {
-            inner: self.parser.reader.prefixes(),
+            inner: self.parser.reader.resolver().bindings(),
+            custom_entities: &self.parser.custom_entities,
             decoder: self.parser.reader.decoder(),
             lenient: self.parser.lenient,
         }
@@ -349,7 +356,7 @@ impl<R: Read> ReaderRdfXmlParser<R> {
     }
 }
 
-/// Parses a RDF/XML file from a [`AsyncRead`] implementation.
+/// Parses an RDF/XML file from a [`AsyncRead`] implementation.
 ///
 /// Can be built using [`RdfXmlParser::for_tokio_async_reader`].
 ///
@@ -357,7 +364,7 @@ impl<R: Read> ReaderRdfXmlParser<R> {
 /// ```
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxrdfxml::RdfXmlParser;
 ///
@@ -370,12 +377,12 @@ impl<R: Read> ReaderRdfXmlParser<R> {
 ///   <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
 /// </rdf:RDF>"#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// let mut parser = RdfXmlParser::new().for_tokio_async_reader(file.as_bytes());
 /// while let Some(triple) = parser.next().await {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -444,7 +451,8 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderRdfXmlParser<R> {
     /// ```
     pub fn prefixes(&self) -> RdfXmlPrefixesIter<'_> {
         RdfXmlPrefixesIter {
-            inner: self.parser.reader.prefixes(),
+            inner: self.parser.reader.resolver().bindings(),
+            custom_entities: &self.parser.custom_entities,
             decoder: self.parser.reader.decoder(),
             lenient: self.parser.lenient,
         }
@@ -492,13 +500,13 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderRdfXmlParser<R> {
     }
 }
 
-/// Parses a RDF/XML file from a byte slice.
+/// Parses an RDF/XML file from a byte slice.
 ///
 /// Can be built using [`RdfXmlParser::for_slice`].
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxrdfxml::RdfXmlParser;
 ///
@@ -511,11 +519,11 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderRdfXmlParser<R> {
 ///  <schema:Person rdf:about="http://example.com/bar" schema:name="Bar" />
 /// </rdf:RDF>"#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in RdfXmlParser::new().for_slice(file) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -581,7 +589,8 @@ impl SliceRdfXmlParser<'_> {
     /// ```
     pub fn prefixes(&self) -> RdfXmlPrefixesIter<'_> {
         RdfXmlPrefixesIter {
-            inner: self.parser.reader.prefixes(),
+            inner: self.parser.reader.resolver().bindings(),
+            custom_entities: &self.parser.custom_entities,
             decoder: self.parser.reader.decoder(),
             lenient: self.parser.lenient,
         }
@@ -625,7 +634,8 @@ impl SliceRdfXmlParser<'_> {
 ///
 /// See [`ReaderRdfXmlParser::prefixes`].
 pub struct RdfXmlPrefixesIter<'a> {
-    inner: PrefixIter<'a>,
+    inner: NamespaceBindingsIter<'a>,
+    custom_entities: &'a EntityRegistry,
     decoder: Decoder,
     lenient: bool,
 }
@@ -644,7 +654,9 @@ impl<'a> Iterator for RdfXmlPrefixesIter<'a> {
                         let Ok(Cow::Borrowed(name)) = self.decoder.decode(name) else {
                             continue;
                         };
-                        let Ok(Cow::Borrowed(name)) = unescape_with(name, |_| None) else {
+                        let Ok(Cow::Borrowed(name)) =
+                            unescape_with(name, |e| self.custom_entities.resolve(e))
+                        else {
                             continue;
                         };
                         if !self.lenient && !is_nc_name(name) {
@@ -657,7 +669,9 @@ impl<'a> Iterator for RdfXmlPrefixesIter<'a> {
                     let Ok(Cow::Borrowed(value)) = self.decoder.decode(value.0) else {
                         continue;
                     };
-                    let Ok(Cow::Borrowed(value)) = unescape_with(value, |_| None) else {
+                    let Ok(Cow::Borrowed(value)) =
+                        unescape_with(value, |e| self.custom_entities.resolve(e))
+                    else {
                         continue;
                     };
                     if !self.lenient && Iri::parse(value).is_err() {
@@ -705,35 +719,29 @@ const RESERVED_RDF_ELEMENTS: [&str; 11] = [
     RDF_RESOURCE,
 ];
 
-const RESERVED_RDF_ATTRIBUTES: [&str; 5] = [
-    RDF_ABOUT_EACH,
-    RDF_ABOUT_EACH_PREFIX,
-    RDF_LI,
-    RDF_RDF,
-    RDF_RESOURCE,
-];
+const RESERVED_RDF_ATTRIBUTES: [&str; 4] = [RDF_ABOUT_EACH, RDF_ABOUT_EACH_PREFIX, RDF_LI, RDF_RDF];
 
 #[derive(Clone, Debug)]
 enum NodeOrText {
     Node(NamedOrBlankNode),
-    Text(String),
+    Text(OxString),
 }
 
 enum RdfXmlState {
     Doc {
-        base_iri: Option<Iri<String>>,
+        base_iri: Option<Iri<OxString>>,
     },
     Rdf {
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")]
         base_direction: Option<BaseDirection>,
         #[cfg(feature = "rdf-12")]
         rdf_version: Option<RdfVersion>,
     },
     NodeElt {
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")]
         base_direction: Option<BaseDirection>,
         subject: NamedOrBlankNode,
@@ -744,8 +752,8 @@ enum RdfXmlState {
     PropertyElt {
         // Resource, Literal or Empty property element
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")]
         base_direction: Option<BaseDirection>,
         subject: NamedOrBlankNode,
@@ -761,8 +769,8 @@ enum RdfXmlState {
     },
     ParseTypeCollectionPropertyElt {
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")]
         base_direction: Option<BaseDirection>,
         subject: NamedOrBlankNode,
@@ -777,8 +785,8 @@ enum RdfXmlState {
     },
     ParseTypeLiteralPropertyElt {
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")]
         base_direction: Option<BaseDirection>,
         subject: NamedOrBlankNode,
@@ -795,8 +803,8 @@ enum RdfXmlState {
     #[cfg(feature = "rdf-12")]
     ParseTypeTriplePropertyElt {
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         base_direction: Option<BaseDirection>,
         subject: NamedOrBlankNode,
         id_attr: Option<NamedNode>,
@@ -810,11 +818,13 @@ enum RdfXmlState {
 struct InternalRdfXmlParser<R> {
     reader: NsReader<R>,
     state: Vec<RdfXmlState>,
-    custom_entities: HashMap<String, String>,
+    custom_entities: EntityRegistry,
     in_literal_depth: usize,
-    known_rdf_id: HashSet<String>,
+    known_rdf_id: HashSet<OxString>,
     is_end: bool,
     lenient: bool,
+    xml_version: XmlVersion,
+    text_buffer: String,
 }
 
 impl<R> InternalRdfXmlParser<R> {
@@ -824,17 +834,49 @@ impl<R> InternalRdfXmlParser<R> {
         results: &mut Vec<Triple>,
     ) -> Result<(), RdfXmlParseError> {
         match event {
-            Event::Start(event) => self.parse_start_event(&event, results),
-            Event::End(event) => self.parse_end_event(&event, results),
-            Event::Empty(_) => Err(RdfXmlSyntaxError::msg(
-                "The expand_empty_elements option must be enabled",
-            )
-            .into()),
-            Event::Text(event) => self.parse_text_event(&event),
-            Event::CData(event) => self.parse_text_event(&event.escape()?),
+            Event::Start(event) => {
+                // We make sure we always run both, even if one fail for better error recovery
+                let text_error = if self.text_buffer.is_empty() {
+                    Ok(())
+                } else {
+                    let text = OxString::new_owned(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.parse_text_event(text)
+                };
+                let start_error = self.parse_start_event(&event, results);
+                text_error.and(start_error)
+            }
+            Event::End(event) => {
+                // We make sure we always run both, even if one fail for better error recovery
+                let text_error = if self.text_buffer.is_empty() {
+                    Ok(())
+                } else {
+                    let text = OxString::new_owned(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.parse_text_event(text)
+                };
+                let end_error = self.parse_end_event(&event, results);
+                text_error.and(end_error)
+            }
+            Event::Empty(_) => unreachable!("The expand_empty_elements option must be enabled",),
+            Event::Text(event) => {
+                self.text_buffer
+                    .push_str(&event.xml_content(self.xml_version)?);
+                Ok(())
+            }
+            Event::GeneralRef(event) => {
+                self.decode_xml_entity(&event)?;
+                Ok(())
+            }
+            Event::CData(event) => {
+                self.text_buffer
+                    .push_str(&event.xml_content(self.xml_version)?);
+                Ok(())
+            }
             Event::Comment(_) | Event::PI(_) => Ok(()),
-            Event::Decl(decl) => {
-                if let Some(encoding) = decl.encoding() {
+            Event::Decl(event) => {
+                self.xml_version = event.xml_version()?;
+                if let Some(encoding) = event.encoding() {
                     if !is_utf8(&encoding?) {
                         return Err(RdfXmlSyntaxError::msg(
                             "Only UTF-8 is supported by the RDF/XML parser",
@@ -847,6 +889,11 @@ impl<R> InternalRdfXmlParser<R> {
             Event::DocType(dt) => self.parse_doctype(&dt),
             Event::Eof => {
                 self.is_end = true;
+                if !self.text_buffer.is_empty() {
+                    let text = OxString::new_owned(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.parse_text_event(text)?;
+                }
                 Ok(())
             }
         }
@@ -854,13 +901,7 @@ impl<R> InternalRdfXmlParser<R> {
 
     fn parse_doctype(&mut self, dt: &BytesText<'_>) -> Result<(), RdfXmlParseError> {
         // we extract entities
-        for input in self
-            .reader
-            .decoder()
-            .decode(dt.as_ref())?
-            .split('<')
-            .skip(1)
-        {
+        for input in dt.xml_content(self.xml_version)?.split('<').skip(1) {
             if let Some(input) = input.strip_prefix("!ENTITY") {
                 let input = input.trim_start().strip_prefix('%').unwrap_or(input);
                 let (entity_name, input) = input.trim_start().split_once(|c: char| c.is_ascii_whitespace()).ok_or_else(|| {
@@ -881,9 +922,10 @@ impl<R> InternalRdfXmlParser<R> {
                 })?;
 
                 // Resolves custom entities within the current entity definition.
-                let entity_value =
-                    unescape_with(entity_value, |e| self.resolve_entity(e)).map_err(Error::from)?;
+                let entity_value = unescape_with(entity_value, |e| self.custom_entities.resolve(e))
+                    .map_err(Error::from)?;
                 self.custom_entities
+                    .0
                     .insert(entity_name.to_owned(), entity_value.to_string());
             }
         }
@@ -926,16 +968,24 @@ impl<R> InternalRdfXmlParser<R> {
                 clean_event.push_attribute(attr.map_err(Error::InvalidAttr)?);
             }
             if self.in_literal_depth == 0 {
-                for (prefix, namespace) in self.reader.prefixes() {
+                for (prefix, namespace) in self.reader.resolver().bindings() {
+                    let namespace = self.reader.decoder().decode(namespace.into_inner())?;
+                    if let Err(error) = Iri::parse(namespace.as_ref()) {
+                        return Err(RdfXmlSyntaxError::invalid_iri(
+                            OxString::new_owned(&namespace),
+                            error,
+                        )
+                        .into());
+                    }
                     match prefix {
                         PrefixDeclaration::Default => {
-                            clean_event.push_attribute(("xmlns".as_bytes(), namespace.into_inner()))
+                            clean_event.push_attribute(("xmlns".as_bytes(), namespace.as_bytes()))
                         }
                         PrefixDeclaration::Named(name) => {
                             let mut attr = Vec::with_capacity(6 + name.len());
                             attr.extend_from_slice(b"xmlns:");
                             attr.extend_from_slice(name);
-                            clean_event.push_attribute((attr.as_slice(), namespace.into_inner()))
+                            clean_event.push_attribute((attr.as_slice(), namespace.as_bytes()))
                         }
                     }
                 }
@@ -945,7 +995,7 @@ impl<R> InternalRdfXmlParser<R> {
             return Ok(());
         }
 
-        let (tag_namespace, tag_local_name) = self.reader.resolve_element(event.name());
+        let (tag_namespace, tag_local_name) = self.reader.resolver().resolve_element(event.name());
         let tag_name = self.resolve_ns_name(tag_namespace, tag_local_name)?;
 
         // We read attributes
@@ -954,7 +1004,7 @@ impl<R> InternalRdfXmlParser<R> {
         let mut id_attr = None;
         let mut node_id_attr = None;
         let mut about_attr = None;
-        let mut property_attrs = Vec::default();
+        let mut property_attrs = Vec::new();
         let mut resource_attr = None;
         let mut datatype_attr = None;
         let mut parse_type = RdfXmlParseType::Default;
@@ -971,13 +1021,14 @@ impl<R> InternalRdfXmlParser<R> {
         for attribute in event.attributes() {
             let attribute = attribute.map_err(Error::InvalidAttr)?;
             let (attribute_namespace, attribute_local_name) =
-                self.reader.resolve_attribute(attribute.key);
+                self.reader.resolver().resolve_attribute(attribute.key);
             if attribute_namespace
                 == ResolveResult::Bound(Namespace(b"http://www.w3.org/XML/1998/namespace"))
             {
                 match attribute.key.local_name().as_ref() {
                     b"lang" => {
-                        let tag = self.convert_attribute(&attribute)?.to_ascii_lowercase();
+                        let mut tag = OxString::new_owned(&self.convert_attribute(&attribute)?);
+                        tag.make_mut().make_ascii_lowercase();
                         language = Some(if self.lenient {
                             tag
                         } else {
@@ -989,13 +1040,12 @@ impl<R> InternalRdfXmlParser<R> {
                         });
                     }
                     b"base" => {
-                        let iri = self.convert_attribute(&attribute)?;
+                        let iri = OxString::new_owned(&self.convert_attribute(&attribute)?);
                         base_iri = Some(if self.lenient {
-                            Iri::parse_unchecked(iri.into_owned())
+                            Iri::parse_unchecked(iri)
                         } else {
-                            Iri::parse(iri.clone().into_owned()).map_err(|error| {
-                                RdfXmlSyntaxError::invalid_iri(iri.into(), error)
-                            })?
+                            Iri::parse(iri.clone())
+                                .map_err(|error| RdfXmlSyntaxError::invalid_iri(iri, error))?
                         })
                     }
                     _ => (), // We ignore other xml attributes
@@ -1046,7 +1096,7 @@ impl<R> InternalRdfXmlParser<R> {
                         ))
                         .into());
                     }
-                    node_id_attr = Some(BlankNode::new_unchecked(id));
+                    node_id_attr = Some(BlankNode::new_unchecked(OxString::new_owned(&id)));
                 } else if *attribute_url == *RDF_ABOUT {
                     about_attr = Some(attribute);
                 } else if *attribute_url == *RDF_RESOURCE {
@@ -1088,7 +1138,7 @@ impl<R> InternalRdfXmlParser<R> {
                 } else {
                     property_attrs.push((
                         self.parse_iri(attribute_url)?,
-                        self.convert_attribute(&attribute)?.into(),
+                        OxString::new_owned(&self.convert_attribute(&attribute)?),
                     ));
                 }
             }
@@ -1096,7 +1146,7 @@ impl<R> InternalRdfXmlParser<R> {
 
         // Parsing with the base URI
         let id_attr = if let Some(iri) = id_attr {
-            let iri = self.resolve_iri(base_iri.as_ref(), iri.into())?;
+            let iri = self.resolve_iri(base_iri.as_ref(), &iri)?;
             if !self.lenient {
                 if self.known_rdf_id.contains(iri.as_str()) {
                     return Err(RdfXmlSyntaxError::msg(format!(
@@ -1104,7 +1154,7 @@ impl<R> InternalRdfXmlParser<R> {
                     ))
                     .into());
                 }
-                self.known_rdf_id.insert(iri.as_str().into());
+                self.known_rdf_id.insert(iri.clone().into_string());
             }
             Some(iri)
         } else {
@@ -1167,7 +1217,7 @@ impl<R> InternalRdfXmlParser<R> {
                 ))
                 .into());
             }
-            Some(BlankNode::new_unchecked(id))
+            Some(BlankNode::new_unchecked(OxString::new_owned(&id)))
         } else {
             None
         };
@@ -1184,7 +1234,7 @@ impl<R> InternalRdfXmlParser<R> {
             },
             Some(RdfXmlState::ParseTypeLiteralPropertyElt { .. }) => {
                 return Err(
-                    RdfXmlSyntaxError::msg("ParseTypeLiteralPropertyElt production children should never be considered as a RDF/XML content").into()
+                    RdfXmlSyntaxError::msg("ParseTypeLiteralPropertyElt production children should never be considered as an RDF/XML content").into()
                 );
             }
             #[cfg(feature = "rdf-12")]
@@ -1264,9 +1314,9 @@ impl<R> InternalRdfXmlParser<R> {
                         .into());
                     };
                     *li_counter += 1;
-                    NamedNode::new_unchecked(format!(
+                    NamedNode::new_unchecked(OxString::new_owned(&format!(
                         "http://www.w3.org/1999/02/22-rdf-syntax-ns#_{li_counter}"
-                    ))
+                    )))
                 } else if RESERVED_RDF_ELEMENTS.contains(&&*tag_name)
                     || *tag_name == *RDF_DESCRIPTION
                 {
@@ -1293,7 +1343,7 @@ impl<R> InternalRdfXmlParser<R> {
                             self.emit_property_attrs(
                                 &object,
                                 property_attrs,
-                                language.as_deref(),
+                                language.as_ref(),
                                 #[cfg(feature = "rdf-12")]
                                 base_direction,
                                 results,
@@ -1348,7 +1398,7 @@ impl<R> InternalRdfXmlParser<R> {
                         #[cfg(feature = "rdf-12")]
                         base_direction,
                         subject,
-                        writer: Writer::new(Vec::default()),
+                        writer: Writer::new(Vec::new()),
                         id_attr,
                         #[cfg(feature = "rdf-12")]
                         annotation_attr,
@@ -1381,7 +1431,7 @@ impl<R> InternalRdfXmlParser<R> {
                         #[cfg(feature = "rdf-12")]
                         base_direction,
                         subject,
-                        objects: Vec::default(),
+                        objects: Vec::new(),
                         id_attr,
                         #[cfg(feature = "rdf-12")]
                         annotation_attr,
@@ -1413,7 +1463,7 @@ impl<R> InternalRdfXmlParser<R> {
                         #[cfg(feature = "rdf-12")]
                         base_direction,
                         subject,
-                        writer: Writer::new(Vec::default()),
+                        writer: Writer::new(Vec::new()),
                         id_attr,
                         #[cfg(feature = "rdf-12")]
                         annotation_attr,
@@ -1455,8 +1505,7 @@ impl<R> InternalRdfXmlParser<R> {
         Ok(())
     }
 
-    fn parse_text_event(&mut self, event: &BytesText<'_>) -> Result<(), RdfXmlParseError> {
-        let text = event.unescape_with(|e| self.resolve_entity(e))?.to_string();
+    fn parse_text_event(&mut self, text: OxString) -> Result<(), RdfXmlParseError> {
         match self.state.last_mut() {
             Some(RdfXmlState::PropertyElt { object, .. }) => {
                 if is_object_defined(object) {
@@ -1491,17 +1540,18 @@ impl<R> InternalRdfXmlParser<R> {
         &self,
         namespace: ResolveResult<'_>,
         local_name: LocalName<'_>,
-    ) -> Result<String, RdfXmlParseError> {
+    ) -> Result<OxString, RdfXmlParseError> {
         match namespace {
             ResolveResult::Bound(ns) => {
                 let mut value = Vec::with_capacity(ns.as_ref().len() + local_name.as_ref().len());
                 value.extend_from_slice(ns.as_ref());
                 value.extend_from_slice(local_name.as_ref());
-                Ok(unescape_with(&self.reader.decoder().decode(&value)?, |e| {
-                    self.resolve_entity(e)
-                })
-                .map_err(Error::from)?
-                .to_string())
+                Ok(OxString::new_owned(
+                    &unescape_with(&self.reader.decoder().decode(&value)?, |e| {
+                        self.custom_entities.resolve(e)
+                    })
+                    .map_err(Error::from)?,
+                ))
             }
             ResolveResult::Unbound => {
                 Err(RdfXmlSyntaxError::msg("XML namespaces are required in RDF/XML").into())
@@ -1518,14 +1568,14 @@ impl<R> InternalRdfXmlParser<R> {
     fn build_node_elt(
         &mut self,
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")] base_direction: Option<BaseDirection>,
         id_attr: Option<NamedNode>,
         node_id_attr: Option<BlankNode>,
         about_attr: Option<NamedNode>,
         type_attr: Option<NamedNode>,
-        property_attrs: Vec<(NamedNode, String)>,
+        property_attrs: Vec<(NamedNode, OxString)>,
         #[cfg(feature = "rdf-12")] rdf_version: Option<RdfVersion>,
         results: &mut Vec<Triple>,
     ) -> Result<RdfXmlState, RdfXmlSyntaxError> {
@@ -1554,7 +1604,7 @@ impl<R> InternalRdfXmlParser<R> {
         self.emit_property_attrs(
             &subject,
             property_attrs,
-            language.as_deref(),
+            language.as_ref(),
             #[cfg(feature = "rdf-12")]
             base_direction,
             results,
@@ -1583,8 +1633,8 @@ impl<R> InternalRdfXmlParser<R> {
     fn build_parse_type_resource_property_elt(
         &mut self,
         iri: NamedNode,
-        base_iri: Option<Iri<String>>,
-        language: Option<String>,
+        base_iri: Option<Iri<OxString>>,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")] base_direction: Option<BaseDirection>,
         #[cfg(feature = "rdf-12")] rdf_version: Option<RdfVersion>,
         subject: NamedOrBlankNode,
@@ -1651,7 +1701,7 @@ impl<R> InternalRdfXmlParser<R> {
                         .into(),
                     None => self
                         .new_literal(
-                            String::new(),
+                            OxString::new(""),
                             language,
                             #[cfg(feature = "rdf-12")]
                             base_direction,
@@ -1727,11 +1777,11 @@ impl<R> InternalRdfXmlParser<R> {
                         subject,
                         iri,
                         Literal::new_typed_literal(
-                            str::from_utf8(&object).map_err(|_| {
+                            OxString::new_owned(&String::from_utf8(object).map_err(|_| {
                                 RdfXmlSyntaxError::msg(
                                     "The XML literal is not in valid UTF-8".to_owned(),
                                 )
-                            })?,
+                            })?),
                             rdf::XML_LITERAL,
                         ),
                     );
@@ -1799,8 +1849,8 @@ impl<R> InternalRdfXmlParser<R> {
 
     fn new_literal(
         &self,
-        value: String,
-        language: Option<String>,
+        value: OxString,
+        language: Option<OxString>,
         #[cfg(feature = "rdf-12")] base_direction: Option<BaseDirection>,
         datatype: Option<NamedNode>,
     ) -> Literal {
@@ -1872,8 +1922,8 @@ impl<R> InternalRdfXmlParser<R> {
     fn emit_property_attrs(
         &mut self,
         subject: &NamedOrBlankNode,
-        literal_attributes: Vec<(NamedNode, String)>,
-        language: Option<&str>,
+        literal_attributes: Vec<(NamedNode, OxString)>,
+        language: Option<&OxString>,
         #[cfg(feature = "rdf-12")] base_direction: Option<BaseDirection>,
         results: &mut Vec<Triple>,
     ) {
@@ -1890,15 +1940,21 @@ impl<R> InternalRdfXmlParser<R> {
                         {
                             Literal::new_directional_language_tagged_literal_unchecked(
                                 literal_value,
-                                language,
+                                language.clone(),
                                 base_direction,
                             )
                         } else {
-                            Literal::new_language_tagged_literal_unchecked(literal_value, language)
+                            Literal::new_language_tagged_literal_unchecked(
+                                literal_value,
+                                language.clone(),
+                            )
                         }
                         #[cfg(not(feature = "rdf-12"))]
                         {
-                            Literal::new_language_tagged_literal_unchecked(literal_value, language)
+                            Literal::new_language_tagged_literal_unchecked(
+                                literal_value,
+                                language.clone(),
+                            )
                         }
                     } else {
                         Literal::new_simple_literal(literal_value)
@@ -1924,40 +1980,44 @@ impl<R> InternalRdfXmlParser<R> {
         &self,
         attribute: &Attribute<'a>,
     ) -> Result<Cow<'a, str>, RdfXmlParseError> {
-        Ok(attribute
-            .decode_and_unescape_value_with(self.reader.decoder(), |e| self.resolve_entity(e))?)
+        Ok(attribute.decoded_and_normalized_value_with(
+            self.xml_version,
+            self.reader.decoder(),
+            MAX_ENTITY_NESTING,
+            |e| self.custom_entities.resolve(e),
+        )?)
     }
 
     fn convert_iri_attribute(
         &self,
-        base_iri: Option<&Iri<String>>,
+        base_iri: Option<&Iri<OxString>>,
         attribute: &Attribute<'_>,
     ) -> Result<NamedNode, RdfXmlParseError> {
-        Ok(self.resolve_iri(base_iri, self.convert_attribute(attribute)?)?)
+        Ok(self.resolve_iri(base_iri, &self.convert_attribute(attribute)?)?)
     }
 
     fn resolve_iri(
         &self,
-        base_iri: Option<&Iri<String>>,
-        relative_iri: Cow<'_, str>,
+        base_iri: Option<&Iri<OxString>>,
+        relative_iri: &str,
     ) -> Result<NamedNode, RdfXmlSyntaxError> {
         if let Some(base_iri) = base_iri.or_else(|| self.current_base_iri()) {
-            Ok(NamedNode::new_unchecked(
-                if self.lenient {
-                    base_iri.resolve_unchecked(&relative_iri)
+            Ok(NamedNode::new_unchecked(OxString::new_owned(
+                &if self.lenient {
+                    base_iri.resolve_unchecked(relative_iri)
                 } else {
-                    base_iri.resolve(&relative_iri).map_err(|error| {
-                        RdfXmlSyntaxError::invalid_iri(relative_iri.into(), error)
+                    base_iri.resolve(relative_iri).map_err(|error| {
+                        RdfXmlSyntaxError::invalid_iri(OxString::new_owned(relative_iri), error)
                     })?
                 }
                 .into_inner(),
-            ))
+            )))
         } else {
-            self.parse_iri(relative_iri.into())
+            self.parse_iri(OxString::new_owned(relative_iri))
         }
     }
 
-    fn parse_iri(&self, relative_iri: String) -> Result<NamedNode, RdfXmlSyntaxError> {
+    fn parse_iri(&self, relative_iri: OxString) -> Result<NamedNode, RdfXmlSyntaxError> {
         Ok(NamedNode::new_unchecked(if self.lenient {
             relative_iri
         } else {
@@ -1967,7 +2027,7 @@ impl<R> InternalRdfXmlParser<R> {
         }))
     }
 
-    fn current_language(&self) -> Option<&str> {
+    fn current_language(&self) -> Option<&OxString> {
         for state in self.state.iter().rev() {
             match state {
                 RdfXmlState::Doc { .. } => (),
@@ -2016,7 +2076,7 @@ impl<R> InternalRdfXmlParser<R> {
         None
     }
 
-    fn current_base_iri(&self) -> Option<&Iri<String>> {
+    fn current_base_iri(&self) -> Option<&Iri<OxString>> {
         for state in self.state.iter().rev() {
             match state {
                 RdfXmlState::Doc { base_iri }
@@ -2065,8 +2125,26 @@ impl<R> InternalRdfXmlParser<R> {
         RdfVersion::V11
     }
 
-    fn resolve_entity(&self, e: &str) -> Option<&str> {
-        resolve_xml_entity(e).or_else(|| self.custom_entities.get(e).map(String::as_str))
+    fn decode_xml_entity(&mut self, event: &BytesRef<'_>) -> Result<(), Error> {
+        if let Some(char_ref) = event.resolve_char_ref()? {
+            self.text_buffer.push(char_ref);
+            return Ok(());
+        }
+        let reference = event.xml_content(self.xml_version)?;
+        let Some(value) = self.custom_entities.resolve(&reference) else {
+            return Err(EscapeError::UnrecognizedEntity(0..event.len(), reference.into()).into());
+        };
+        self.text_buffer.push_str(value);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EntityRegistry(HashMap<String, String>);
+
+impl EntityRegistry {
+    fn resolve(&self, e: &str) -> Option<&str> {
+        resolve_xml_entity(e).or_else(|| self.0.get(e).map(String::as_str))
     }
 }
 

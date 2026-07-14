@@ -1,7 +1,6 @@
 //! A [Turtle](https://www.w3.org/TR/turtle/) streaming parser implemented by [`TurtleParser`]
 //! and a serializer implemented by [`TurtleSerializer`].
 
-use crate::MIN_PARALLEL_CHUNK_SIZE;
 use crate::chunker::get_turtle_slice_chunks;
 use crate::terse::TriGRecognizer;
 #[cfg(feature = "async-tokio")]
@@ -10,8 +9,9 @@ use crate::toolkit::{Parser, ReaderIterator, SliceIterator, TurtleParseError, Tu
 #[cfg(feature = "async-tokio")]
 use crate::trig::TokioAsyncWriterTriGSerializer;
 use crate::trig::{LowLevelTriGSerializer, TriGSerializer, WriterTriGSerializer};
+use crate::{DEFAULT_MAX_BUFFER_SIZE, MIN_PARALLEL_CHUNK_SIZE};
 use oxiri::{Iri, IriParseError};
-use oxrdf::{GraphNameRef, Triple, TripleRef};
+use oxrdf::{OxString, Triple};
 use std::collections::HashMap;
 use std::collections::hash_map::Iter;
 use std::io::{self, Read, Write};
@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxttl::TurtleParser;
 ///
@@ -33,30 +33,53 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in TurtleParser::new().for_reader(file.as_bytes()) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
 /// assert_eq!(2, count);
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
-#[derive(Default, Clone)]
+#[derive(Clone)]
 #[must_use]
 pub struct TurtleParser {
     lenient: bool,
-    base: Option<Iri<String>>,
-    prefixes: HashMap<String, Iri<String>>,
+    base: Option<Iri<OxString>>,
+    prefixes: HashMap<OxString, Iri<OxString>>,
+    max_buffer_size: usize,
+}
+
+impl Default for TurtleParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TurtleParser {
     /// Builds a new [`TurtleParser`].
     #[inline]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+            lenient: false,
+            base: None,
+            prefixes: HashMap::new(),
+        }
+    }
+
+    /// Define an upper bound for the internal buffer of the parser in bytes
+    ///
+    /// This limits the memory consumption of the parser and the maximum size of parsed IRIs and literals.
+    ///
+    /// The default is set conservatively, use this function to change it (e.g. to [`usize::MAX`] to not set an upper bound).
+    #[inline]
+    pub fn with_max_buffer_size(mut self, max_buffer_size: usize) -> Self {
+        self.max_buffer_size = max_buffer_size;
+        self
     }
 
     /// Assumes the file is valid to make parsing faster.
@@ -71,19 +94,21 @@ impl TurtleParser {
     }
 
     #[inline]
-    pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
-        self.base = Some(Iri::parse(base_iri.into())?);
+    pub fn with_base_iri(mut self, base_iri: &str) -> Result<Self, IriParseError> {
+        self.base = Some(Iri::parse(OxString::new_owned(base_iri))?);
         Ok(self)
     }
 
     #[inline]
     pub fn with_prefix(
         mut self,
-        prefix_name: impl Into<String>,
-        prefix_iri: impl Into<String>,
+        prefix_name: &str,
+        prefix_iri: &str,
     ) -> Result<Self, IriParseError> {
-        self.prefixes
-            .insert(prefix_name.into(), Iri::parse(prefix_iri.into())?);
+        self.prefixes.insert(
+            OxString::new_owned(prefix_name),
+            Iri::parse(OxString::new_owned(prefix_iri))?,
+        );
         Ok(self)
     }
 
@@ -91,7 +116,7 @@ impl TurtleParser {
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxttl::TurtleParser;
     ///
@@ -102,11 +127,11 @@ impl TurtleParser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// for triple in TurtleParser::new().for_reader(file.as_bytes()) {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -125,7 +150,7 @@ impl TurtleParser {
     /// ```
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxttl::TurtleParser;
     ///
@@ -136,12 +161,12 @@ impl TurtleParser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// let mut parser = TurtleParser::new().for_tokio_async_reader(file.as_bytes());
     /// while let Some(triple) = parser.next().await {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -163,7 +188,7 @@ impl TurtleParser {
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxttl::TurtleParser;
     ///
@@ -174,11 +199,11 @@ impl TurtleParser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// for triple in TurtleParser::new().for_slice(file) {
     ///     let triple = triple?;
-    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///         count += 1;
     ///     }
     /// }
@@ -194,6 +219,7 @@ impl TurtleParser {
                 self.lenient,
                 self.base,
                 self.prefixes,
+                self.max_buffer_size,
             )
             .into_iter(),
         }
@@ -207,7 +233,7 @@ impl TurtleParser {
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxttl::TurtleParser;
     /// use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -219,7 +245,7 @@ impl TurtleParser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let readers = TurtleParser::new().split_slice_for_parallel_parsing(file, 2);
     /// let count = readers
     ///     .into_par_iter()
@@ -227,7 +253,7 @@ impl TurtleParser {
     ///         let mut count = 0;
     ///         for triple in reader {
     ///             let triple = triple.unwrap();
-    ///             if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///             if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///                 count += 1;
     ///             }
     ///         }
@@ -266,7 +292,7 @@ impl TurtleParser {
     ///
     /// Count the number of people:
     /// ```
-    /// use oxrdf::NamedNodeRef;
+    /// use oxrdf::NamedNode;
     /// use oxrdf::vocab::rdf;
     /// use oxttl::TurtleParser;
     ///
@@ -278,7 +304,7 @@ impl TurtleParser {
     ///     b" a schema:Person ; schema:name \"Bar\" .",
     /// ];
     ///
-    /// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+    /// let schema_person = NamedNode::new("http://schema.org/Person")?;
     /// let mut count = 0;
     /// let mut parser = TurtleParser::new().low_level();
     /// let mut file_chunks = file.iter();
@@ -292,7 +318,7 @@ impl TurtleParser {
     ///     // We read as many triples from the parser as possible
     ///     while let Some(triple) = parser.parse_next() {
     ///         let triple = triple?;
-    ///         if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+    ///         if triple.predicate == rdf::TYPE && triple.object == schema_person {
     ///             count += 1;
     ///         }
     ///     }
@@ -309,6 +335,7 @@ impl TurtleParser {
                 self.lenient,
                 self.base,
                 self.prefixes,
+                self.max_buffer_size,
             ),
         }
     }
@@ -320,7 +347,7 @@ impl TurtleParser {
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxttl::TurtleParser;
 ///
@@ -331,11 +358,11 @@ impl TurtleParser {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in TurtleParser::new().for_reader(file.as_bytes()) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -423,7 +450,7 @@ impl<R: Read> Iterator for ReaderTurtleParser<R> {
 /// ```
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxttl::TurtleParser;
 ///
@@ -434,12 +461,12 @@ impl<R: Read> Iterator for ReaderTurtleParser<R> {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// let mut parser = TurtleParser::new().for_tokio_async_reader(file.as_bytes());
 /// while let Some(triple) = parser.next().await {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -532,7 +559,7 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderTurtleParser<R> {
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxttl::TurtleParser;
 ///
@@ -543,11 +570,11 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderTurtleParser<R> {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// for triple in TurtleParser::new().for_slice(file) {
 ///     let triple = triple?;
-///     if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///     if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///         count += 1;
 ///     }
 /// }
@@ -633,7 +660,7 @@ impl Iterator for SliceTurtleParser<'_> {
 ///
 /// Count the number of people:
 /// ```
-/// use oxrdf::NamedNodeRef;
+/// use oxrdf::NamedNode;
 /// use oxrdf::vocab::rdf;
 /// use oxttl::TurtleParser;
 ///
@@ -645,7 +672,7 @@ impl Iterator for SliceTurtleParser<'_> {
 ///     b" a schema:Person ; schema:name \"Bar\" .",
 /// ];
 ///
-/// let schema_person = NamedNodeRef::new("http://schema.org/Person")?;
+/// let schema_person = NamedNode::new("http://schema.org/Person")?;
 /// let mut count = 0;
 /// let mut parser = TurtleParser::new().low_level();
 /// let mut file_chunks = file.iter();
@@ -659,7 +686,7 @@ impl Iterator for SliceTurtleParser<'_> {
 ///     // We read as many triples from the parser as possible
 ///     while let Some(triple) = parser.parse_next() {
 ///         let triple = triple?;
-///         if triple.predicate == rdf::TYPE && triple.object == schema_person.into() {
+///         if triple.predicate == rdf::TYPE && triple.object == schema_person {
 ///             count += 1;
 ///         }
 ///     }
@@ -762,7 +789,7 @@ impl LowLevelTurtleParser {
 ///
 /// See [`LowLevelTurtleParser::prefixes`].
 pub struct TurtlePrefixesIter<'a> {
-    inner: Iter<'a, String, Iri<String>>,
+    inner: Iter<'a, OxString, Iri<OxString>>,
 }
 
 impl<'a> Iterator for TurtlePrefixesIter<'a> {
@@ -784,16 +811,16 @@ impl<'a> Iterator for TurtlePrefixesIter<'a> {
 ///
 /// ```
 /// use oxrdf::vocab::rdf;
-/// use oxrdf::{NamedNodeRef, TripleRef};
+/// use oxrdf::{NamedNode, Triple};
 /// use oxttl::TurtleSerializer;
 ///
 /// let mut serializer = TurtleSerializer::new()
 ///     .with_prefix("schema", "http://schema.org/")?
 ///     .for_writer(Vec::new());
-/// serializer.serialize_triple(TripleRef::new(
-///     NamedNodeRef::new("http://example.com#me")?,
+/// serializer.serialize_triple(&Triple::new(
+///     NamedNode::new("http://example.com#me")?,
 ///     rdf::TYPE,
-///     NamedNodeRef::new("http://schema.org/Person")?,
+///     NamedNode::new("http://schema.org/Person")?,
 /// ))?;
 /// assert_eq!(
 ///     b"@prefix schema: <http://schema.org/> .\n<http://example.com#me> a schema:Person .\n",
@@ -817,8 +844,8 @@ impl TurtleSerializer {
     #[inline]
     pub fn with_prefix(
         mut self,
-        prefix_name: impl Into<String>,
-        prefix_iri: impl Into<String>,
+        prefix_name: &str,
+        prefix_iri: &str,
     ) -> Result<Self, IriParseError> {
         self.inner = self.inner.with_prefix(prefix_name, prefix_iri)?;
         Ok(self)
@@ -828,17 +855,17 @@ impl TurtleSerializer {
     ///
     /// ```
     /// use oxrdf::vocab::rdf;
-    /// use oxrdf::{NamedNodeRef, TripleRef};
+    /// use oxrdf::{NamedNode, Triple};
     /// use oxttl::TurtleSerializer;
     ///
     /// let mut serializer = TurtleSerializer::new()
     ///     .with_base_iri("http://example.com")?
     ///     .with_prefix("ex", "http://example.com/ns#")?
     ///     .for_writer(Vec::new());
-    /// serializer.serialize_triple(TripleRef::new(
-    ///     NamedNodeRef::new("http://example.com/me")?,
+    /// serializer.serialize_triple(&Triple::new(
+    ///     NamedNode::new("http://example.com/me")?,
     ///     rdf::TYPE,
-    ///     NamedNodeRef::new("http://example.com/ns#Person")?,
+    ///     NamedNode::new("http://example.com/ns#Person")?,
     /// ))?;
     /// assert_eq!(
     ///     b"@base <http://example.com> .\n@prefix ex: </ns#> .\n</me> a ex:Person .\n",
@@ -847,7 +874,7 @@ impl TurtleSerializer {
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
     #[inline]
-    pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
+    pub fn with_base_iri(mut self, base_iri: &str) -> Result<Self, IriParseError> {
         self.inner = self.inner.with_base_iri(base_iri)?;
         Ok(self)
     }
@@ -856,16 +883,16 @@ impl TurtleSerializer {
     ///
     /// ```
     /// use oxrdf::vocab::rdf;
-    /// use oxrdf::{NamedNodeRef, TripleRef};
+    /// use oxrdf::{NamedNode, Triple};
     /// use oxttl::TurtleSerializer;
     ///
     /// let mut serializer = TurtleSerializer::new()
     ///     .with_prefix("schema", "http://schema.org/")?
     ///     .for_writer(Vec::new());
-    /// serializer.serialize_triple(TripleRef::new(
-    ///     NamedNodeRef::new("http://example.com#me")?,
+    /// serializer.serialize_triple(&Triple::new(
+    ///     NamedNode::new("http://example.com#me")?,
     ///     rdf::TYPE,
-    ///     NamedNodeRef::new("http://schema.org/Person")?,
+    ///     NamedNode::new("http://schema.org/Person")?,
     /// ))?;
     /// assert_eq!(
     ///     b"@prefix schema: <http://schema.org/> .\n<http://example.com#me> a schema:Person .\n",
@@ -885,17 +912,17 @@ impl TurtleSerializer {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use oxrdf::vocab::rdf;
-    /// use oxrdf::{NamedNodeRef, TripleRef};
+    /// use oxrdf::{NamedNode, Triple};
     /// use oxttl::TurtleSerializer;
     ///
     /// let mut serializer = TurtleSerializer::new()
     ///     .with_prefix("schema", "http://schema.org/")?
     ///     .for_tokio_async_writer(Vec::new());
     /// serializer
-    ///     .serialize_triple(TripleRef::new(
-    ///         NamedNodeRef::new("http://example.com#me")?,
+    ///     .serialize_triple(&Triple::new(
+    ///         NamedNode::new("http://example.com#me")?,
     ///         rdf::TYPE,
-    ///         NamedNodeRef::new("http://schema.org/Person")?,
+    ///         NamedNode::new("http://schema.org/Person")?,
     ///     ))
     ///     .await?;
     /// assert_eq!(
@@ -919,7 +946,7 @@ impl TurtleSerializer {
     ///
     /// ```
     /// use oxrdf::vocab::rdf;
-    /// use oxrdf::{NamedNodeRef, TripleRef};
+    /// use oxrdf::{NamedNode, Triple};
     /// use oxttl::TurtleSerializer;
     ///
     /// let mut buf = Vec::new();
@@ -927,10 +954,10 @@ impl TurtleSerializer {
     ///     .with_prefix("schema", "http://schema.org/")?
     ///     .low_level();
     /// serializer.serialize_triple(
-    ///     TripleRef::new(
-    ///         NamedNodeRef::new("http://example.com#me")?,
+    ///     &Triple::new(
+    ///         NamedNode::new("http://example.com#me")?,
     ///         rdf::TYPE,
-    ///         NamedNodeRef::new("http://schema.org/Person")?,
+    ///         NamedNode::new("http://schema.org/Person")?,
     ///     ),
     ///     &mut buf,
     /// )?;
@@ -954,16 +981,16 @@ impl TurtleSerializer {
 ///
 /// ```
 /// use oxrdf::vocab::rdf;
-/// use oxrdf::{NamedNodeRef, TripleRef};
+/// use oxrdf::{NamedNode, Triple};
 /// use oxttl::TurtleSerializer;
 ///
 /// let mut serializer = TurtleSerializer::new()
 ///     .with_prefix("schema", "http://schema.org/")?
 ///     .for_writer(Vec::new());
-/// serializer.serialize_triple(TripleRef::new(
-///     NamedNodeRef::new("http://example.com#me")?,
+/// serializer.serialize_triple(&Triple::new(
+///     NamedNode::new("http://example.com#me")?,
 ///     rdf::TYPE,
-///     NamedNodeRef::new("http://schema.org/Person")?,
+///     NamedNode::new("http://schema.org/Person")?,
 /// ))?;
 /// assert_eq!(
 ///     b"@prefix schema: <http://schema.org/> .\n<http://example.com#me> a schema:Person .\n",
@@ -978,9 +1005,8 @@ pub struct WriterTurtleSerializer<W: Write> {
 
 impl<W: Write> WriterTurtleSerializer<W> {
     /// Writes an extra triple.
-    pub fn serialize_triple<'a>(&mut self, t: impl Into<TripleRef<'a>>) -> io::Result<()> {
-        self.inner
-            .serialize_quad(t.into().in_graph(GraphNameRef::DefaultGraph))
+    pub fn serialize_triple(&mut self, triple: &Triple) -> io::Result<()> {
+        self.inner.serialize_triple(triple)
     }
 
     /// Ends the write process and returns the underlying [`Write`].
@@ -997,17 +1023,17 @@ impl<W: Write> WriterTurtleSerializer<W> {
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use oxrdf::vocab::rdf;
-/// use oxrdf::{NamedNodeRef, TripleRef};
+/// use oxrdf::{NamedNode, Triple};
 /// use oxttl::TurtleSerializer;
 ///
 /// let mut serializer = TurtleSerializer::new()
 ///     .with_prefix("schema", "http://schema.org/")?
 ///     .for_tokio_async_writer(Vec::new());
 /// serializer
-///     .serialize_triple(TripleRef::new(
-///         NamedNodeRef::new("http://example.com#me")?,
+///     .serialize_triple(&Triple::new(
+///         NamedNode::new("http://example.com#me")?,
 ///         rdf::TYPE,
-///         NamedNodeRef::new("http://schema.org/Person")?,
+///         NamedNode::new("http://schema.org/Person")?,
 ///     ))
 ///     .await?;
 /// assert_eq!(
@@ -1026,10 +1052,8 @@ pub struct TokioAsyncWriterTurtleSerializer<W: AsyncWrite + Unpin> {
 #[cfg(feature = "async-tokio")]
 impl<W: AsyncWrite + Unpin> TokioAsyncWriterTurtleSerializer<W> {
     /// Writes an extra triple.
-    pub async fn serialize_triple<'a>(&mut self, t: impl Into<TripleRef<'a>>) -> io::Result<()> {
-        self.inner
-            .serialize_quad(t.into().in_graph(GraphNameRef::DefaultGraph))
-            .await
+    pub async fn serialize_triple(&mut self, triple: &Triple) -> io::Result<()> {
+        self.inner.serialize_triple(triple).await
     }
 
     /// Ends the write process and returns the underlying [`Write`].
@@ -1044,7 +1068,7 @@ impl<W: AsyncWrite + Unpin> TokioAsyncWriterTurtleSerializer<W> {
 ///
 /// ```
 /// use oxrdf::vocab::rdf;
-/// use oxrdf::{NamedNodeRef, TripleRef};
+/// use oxrdf::{NamedNode, Triple};
 /// use oxttl::TurtleSerializer;
 ///
 /// let mut buf = Vec::new();
@@ -1052,10 +1076,10 @@ impl<W: AsyncWrite + Unpin> TokioAsyncWriterTurtleSerializer<W> {
 ///     .with_prefix("schema", "http://schema.org/")?
 ///     .low_level();
 /// serializer.serialize_triple(
-///     TripleRef::new(
-///         NamedNodeRef::new("http://example.com#me")?,
+///     &Triple::new(
+///         NamedNode::new("http://example.com#me")?,
 ///         rdf::TYPE,
-///         NamedNodeRef::new("http://schema.org/Person")?,
+///         NamedNode::new("http://schema.org/Person")?,
 ///     ),
 ///     &mut buf,
 /// )?;
@@ -1072,13 +1096,8 @@ pub struct LowLevelTurtleSerializer {
 
 impl LowLevelTurtleSerializer {
     /// Writes an extra triple.
-    pub fn serialize_triple<'a>(
-        &mut self,
-        t: impl Into<TripleRef<'a>>,
-        writer: impl Write,
-    ) -> io::Result<()> {
-        self.inner
-            .serialize_quad(t.into().in_graph(GraphNameRef::DefaultGraph), writer)
+    pub fn serialize_triple(&mut self, triple: &Triple, writer: impl Write) -> io::Result<()> {
+        self.inner.serialize_triple(triple, writer)
     }
 
     /// Finishes to write the file.
@@ -1091,30 +1110,30 @@ impl LowLevelTurtleSerializer {
 #[expect(clippy::panic_in_result_fn)]
 mod tests {
     use super::*;
-    use oxrdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
+    use oxrdf::{BlankNode, Literal, NamedNode};
 
     #[test]
     fn test_write() -> io::Result<()> {
         let mut serializer = TurtleSerializer::new().for_writer(Vec::new());
-        serializer.serialize_triple(TripleRef::new(
-            NamedNodeRef::new_unchecked("http://example.com/s"),
-            NamedNodeRef::new_unchecked("http://example.com/p"),
-            NamedNodeRef::new_unchecked("http://example.com/o"),
+        serializer.serialize_triple(&Triple::new(
+            NamedNode::new_unchecked("http://example.com/s"),
+            NamedNode::new_unchecked("http://example.com/p"),
+            NamedNode::new_unchecked("http://example.com/o"),
         ))?;
-        serializer.serialize_triple(TripleRef::new(
-            NamedNodeRef::new_unchecked("http://example.com/s"),
-            NamedNodeRef::new_unchecked("http://example.com/p"),
-            LiteralRef::new_simple_literal("foo"),
+        serializer.serialize_triple(&Triple::new(
+            NamedNode::new_unchecked("http://example.com/s"),
+            NamedNode::new_unchecked("http://example.com/p"),
+            Literal::new_simple_literal("foo"),
         ))?;
-        serializer.serialize_triple(TripleRef::new(
-            NamedNodeRef::new_unchecked("http://example.com/s"),
-            NamedNodeRef::new_unchecked("http://example.com/p2"),
-            LiteralRef::new_language_tagged_literal_unchecked("foo", "en"),
+        serializer.serialize_triple(&Triple::new(
+            NamedNode::new_unchecked("http://example.com/s"),
+            NamedNode::new_unchecked("http://example.com/p2"),
+            Literal::new_language_tagged_literal_unchecked("foo", "en"),
         ))?;
-        serializer.serialize_triple(TripleRef::new(
-            BlankNodeRef::new_unchecked("b"),
-            NamedNodeRef::new_unchecked("http://example.com/p2"),
-            BlankNodeRef::new_unchecked("b2"),
+        serializer.serialize_triple(&Triple::new(
+            BlankNode::new_unchecked("b"),
+            NamedNode::new_unchecked("http://example.com/p2"),
+            BlankNode::new_unchecked("b2"),
         ))?;
         assert_eq!(
             String::from_utf8(serializer.finish()?).map_err(io::Error::other)?,

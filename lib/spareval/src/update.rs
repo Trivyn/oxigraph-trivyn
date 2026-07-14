@@ -11,6 +11,7 @@ use spargebra::term::{
 #[cfg(feature = "sparql-12")]
 use spargebra::term::{GroundTriplePattern, TriplePattern};
 use std::collections::VecDeque;
+use std::mem::take;
 
 /// A [`Quad`] to delete or insert.
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -20,31 +21,70 @@ pub enum DeleteInsertQuad {
 }
 
 /// Output of [`PreparedDeleteInsertUpdate::execute`](super::PreparedDeleteInsertUpdate::execute).
-pub struct DeleteInsertIter<'a> {
+pub struct DeleteInsertIter<'a, 'b> {
     solutions: QuerySolutionIter<'a>,
-    delete: Vec<GroundQuadPattern>,
-    insert: Vec<QuadPattern>,
+    ground_delete: Vec<Quad>,
+    variable_delete: Vec<&'b GroundQuadPattern>,
+    ground_insert: Vec<Quad>,
+    variable_insert: Vec<&'b QuadPattern>,
     buffer: VecDeque<DeleteInsertQuad>,
     bnodes: FxHashMap<BlankNode, BlankNode>,
 }
 
-impl<'a> DeleteInsertIter<'a> {
+impl<'a, 'b> DeleteInsertIter<'a, 'b> {
     pub(crate) fn new(
         solutions: QuerySolutionIter<'a>,
-        delete: Vec<GroundQuadPattern>,
-        insert: Vec<QuadPattern>,
+        delete: &'b [GroundQuadPattern],
+        insert: &'b [QuadPattern],
+        without_optimizations: bool,
     ) -> Self {
+        let mut ground_delete = Vec::new();
+        let mut variable_delete = Vec::new();
+        for quad_pattern in delete {
+            let empty_solution = QuerySolution::default();
+            if without_optimizations {
+                variable_delete.push(quad_pattern);
+            } else if let Some(quad) = fill_ground_quad_pattern(quad_pattern, &empty_solution) {
+                ground_delete.push(quad);
+            } else {
+                variable_delete.push(quad_pattern);
+            }
+        }
+
+        let mut ground_insert = Vec::new();
+        let mut variable_insert = Vec::new();
+        for quad_pattern in insert {
+            let empty_solution = QuerySolution::default();
+            let mut blank_nodes = FxHashMap::default();
+            if without_optimizations {
+                variable_insert.push(quad_pattern);
+            } else if let Some(quad) =
+                fill_quad_pattern(quad_pattern, &empty_solution, &mut blank_nodes)
+            {
+                if blank_nodes.is_empty() {
+                    // We do this check to ensure we don't have to emit a new blank node for each solution.
+                    ground_insert.push(quad);
+                } else {
+                    variable_insert.push(quad_pattern);
+                }
+            } else {
+                variable_insert.push(quad_pattern);
+            }
+        }
+
         Self {
             solutions,
-            delete,
-            insert,
+            ground_delete,
+            variable_delete,
+            ground_insert,
+            variable_insert,
             buffer: VecDeque::new(),
             bnodes: FxHashMap::default(),
         }
     }
 }
 
-impl Iterator for DeleteInsertIter<'_> {
+impl Iterator for DeleteInsertIter<'_, '_> {
     type Item = Result<DeleteInsertQuad, QueryEvaluationError>;
 
     fn next(&mut self) -> Option<Result<DeleteInsertQuad, QueryEvaluationError>> {
@@ -52,16 +92,23 @@ impl Iterator for DeleteInsertIter<'_> {
             if let Some(quad) = self.buffer.pop_front() {
                 return Some(Ok(quad));
             }
-            let solution = match self.solutions.next()? {
-                Ok(solution) => solution,
-                Err(e) => return Some(Err(e)),
+            let solution = match self.solutions.next() {
+                Some(Ok(solution)) => solution,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
             };
-            for quad in &self.delete {
+            for quad in take(&mut self.ground_delete) {
+                self.buffer.push_back(DeleteInsertQuad::Delete(quad));
+            }
+            for quad in &self.variable_delete {
                 if let Some(quad) = fill_ground_quad_pattern(quad, &solution) {
                     self.buffer.push_back(DeleteInsertQuad::Delete(quad));
                 }
             }
-            for quad in &self.insert {
+            for quad in take(&mut self.ground_insert) {
+                self.buffer.push_back(DeleteInsertQuad::Insert(quad));
+            }
+            for quad in &self.variable_insert {
                 if let Some(quad) = fill_quad_pattern(quad, &solution, &mut self.bnodes) {
                     self.buffer.push_back(DeleteInsertQuad::Insert(quad));
                 }

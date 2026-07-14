@@ -1,8 +1,10 @@
 //! Data structures around SPARQL updates. The main type is [`Update`].
+use crate::SparqlParser;
 use crate::algebra::*;
-use crate::parser::{SparqlParser, SparqlSyntaxError};
+use crate::error::SparqlSyntaxError;
 use crate::term::*;
 use oxiri::Iri;
+use oxrdf::OxString;
 use std::fmt;
 use std::str::FromStr;
 
@@ -20,7 +22,7 @@ use std::str::FromStr;
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct Update {
     /// The update base IRI.
-    pub base_iri: Option<Iri<String>>,
+    pub base_iri: Option<Iri<OxString>>,
     /// The [update operations](https://www.w3.org/TR/sparql11-update/#formalModelGraphUpdate).
     pub operations: Vec<GraphUpdateOperation>,
 }
@@ -260,7 +262,7 @@ impl fmt::Display for DeleteInsertOperation {
             }
             writeln!(f, "}}")?;
         }
-        if !self.insert.is_empty() {
+        if !self.insert.is_empty() || self.delete.is_empty() {
             writeln!(f, "INSERT {{")?;
             for quad in &self.insert {
                 writeln!(f, "\t{quad} .")?;
@@ -277,11 +279,12 @@ impl fmt::Display for DeleteInsertOperation {
                 }
             }
         }
-        write!(
-            f,
-            "WHERE {{ {} }}",
-            SparqlGraphRootPattern::new(&self.pattern, None)
-        )
+        let mut pattern = &*self.pattern;
+        // We ignore the root projection, it's useless
+        if let GraphPattern::Project { inner, .. } = pattern {
+            pattern = inner;
+        }
+        write!(f, " WHERE {{ {pattern} }}")
     }
 }
 

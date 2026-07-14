@@ -1,19 +1,21 @@
 //! A [N3](https://w3c.github.io/N3/spec/) streaming parser implemented by [`N3Parser`].
 
-use crate::lexer::{N3Lexer, N3LexerMode, N3LexerOptions, N3Token, resolve_local_name};
+use crate::lexer::{
+    N3Lexer, N3LexerMode, N3LexerOptions, N3Token, resolve_local_name, to_lowercase,
+};
 #[cfg(feature = "async-tokio")]
 use crate::toolkit::TokioAsyncReaderIterator;
 use crate::toolkit::{
     Lexer, Parser, ReaderIterator, RuleRecognizer, RuleRecognizerError, SliceIterator,
     TokenOrLineJump, TurtleSyntaxError,
 };
-use crate::{MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, TurtleParseError};
+use crate::{DEFAULT_MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, TurtleParseError};
 use oxiri::{Iri, IriParseError};
 #[cfg(feature = "rdf-12")]
 use oxrdf::Triple;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{
-    BlankNode, GraphName, Literal, NamedNode, NamedNodeRef, NamedOrBlankNode, Quad, Term, Variable,
+    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, OxString, Quad, Term, Variable,
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Iter;
@@ -22,7 +24,7 @@ use std::io::Read;
 #[cfg(feature = "async-tokio")]
 use tokio::io::AsyncRead;
 
-/// A N3 term i.e. a RDF `Term` or a `Variable`.
+/// A N3 term i.e., an RDF `Term` or a `Variable`.
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub enum N3Term {
     NamedNode(NamedNode),
@@ -51,13 +53,6 @@ impl From<NamedNode> for N3Term {
     #[inline]
     fn from(node: NamedNode) -> Self {
         Self::NamedNode(node)
-    }
-}
-
-impl From<NamedNodeRef<'_>> for N3Term {
-    #[inline]
-    fn from(node: NamedNodeRef<'_>) -> Self {
-        Self::NamedNode(node.into_owned())
     }
 }
 
@@ -181,7 +176,7 @@ impl From<Quad> for N3Quad {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+/// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
 /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
 /// let mut count = 0;
 /// for triple in N3Parser::new().for_reader(file.as_bytes()) {
@@ -193,19 +188,43 @@ impl From<Quad> for N3Quad {
 /// assert_eq!(2, count);
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
-#[derive(Default, Clone)]
+#[derive(Clone)]
 #[must_use]
 pub struct N3Parser {
     lenient: bool,
-    base: Option<Iri<String>>,
-    prefixes: HashMap<String, Iri<String>>,
+    base: Option<Iri<OxString>>,
+    prefixes: HashMap<OxString, Iri<OxString>>,
+    max_buffer_size: usize,
+}
+
+impl Default for N3Parser {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl N3Parser {
     /// Builds a new [`N3Parser`].
     #[inline]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            lenient: false,
+            base: None,
+            prefixes: HashMap::new(),
+            max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+        }
+    }
+
+    /// Define an upper bound for the internal buffer of the parser in bytes
+    ///
+    /// This limits the memory consumption of the parser but also the maximum size of parsed IRIs and literals.
+    ///
+    /// The default is set conservatively, use this function to change it (e.g. to [`usize::MAX`] to not set an upper bound).
+    #[inline]
+    pub fn with_max_buffer_size(mut self, max_buffer_size: usize) -> Self {
+        self.max_buffer_size = max_buffer_size;
+        self
     }
 
     /// Assumes the file is valid to make parsing faster.
@@ -220,19 +239,21 @@ impl N3Parser {
     }
 
     #[inline]
-    pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
-        self.base = Some(Iri::parse(base_iri.into())?);
+    pub fn with_base_iri(mut self, base_iri: &str) -> Result<Self, IriParseError> {
+        self.base = Some(Iri::parse(OxString::new_owned(base_iri))?);
         Ok(self)
     }
 
     #[inline]
     pub fn with_prefix(
         mut self,
-        prefix_name: impl Into<String>,
-        prefix_iri: impl Into<String>,
+        prefix_name: &str,
+        prefix_iri: &str,
     ) -> Result<Self, IriParseError> {
-        self.prefixes
-            .insert(prefix_name.into(), Iri::parse(prefix_iri.into())?);
+        self.prefixes.insert(
+            OxString::new_owned(prefix_name),
+            Iri::parse(OxString::new_owned(prefix_iri))?,
+        );
         Ok(self)
     }
 
@@ -287,7 +308,7 @@ impl N3Parser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
     /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
     /// let mut count = 0;
     /// let mut parser = N3Parser::new().for_tokio_async_reader(file.as_bytes());
@@ -326,7 +347,7 @@ impl N3Parser {
     /// <bar> a schema:Person ;
     ///     schema:name "Bar" ."#;
     ///
-    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
     /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
     /// let mut count = 0;
     /// for triple in N3Parser::new().for_slice(file) {
@@ -340,8 +361,15 @@ impl N3Parser {
     /// ```
     pub fn for_slice(self, slice: &(impl AsRef<[u8]> + ?Sized)) -> SliceN3Parser<'_> {
         SliceN3Parser {
-            inner: N3Recognizer::new_parser(slice.as_ref(), true, false, self.base, self.prefixes)
-                .into_iter(),
+            inner: N3Recognizer::new_parser(
+                slice.as_ref(),
+                true,
+                false,
+                self.base,
+                self.prefixes,
+                self.max_buffer_size,
+            )
+            .into_iter(),
         }
     }
 
@@ -361,7 +389,7 @@ impl N3Parser {
     ///     b" a schema:Person ; schema:name \"Bar\" .",
     /// ];
     ///
-    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+    /// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
     /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
     /// let mut count = 0;
     /// let mut parser = N3Parser::new().low_level();
@@ -392,6 +420,7 @@ impl N3Parser {
                 self.lenient,
                 self.base,
                 self.prefixes,
+                self.max_buffer_size,
             ),
         }
     }
@@ -414,7 +443,7 @@ impl N3Parser {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+/// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
 /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
 /// let mut count = 0;
 /// for triple in N3Parser::new().for_reader(file.as_bytes()) {
@@ -518,7 +547,7 @@ impl<R: Read> Iterator for ReaderN3Parser<R> {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+/// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
 /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
 /// let mut count = 0;
 /// let mut parser = N3Parser::new().for_tokio_async_reader(file.as_bytes());
@@ -628,7 +657,7 @@ impl<R: AsyncRead + Unpin> TokioAsyncReaderN3Parser<R> {
 /// <bar> a schema:Person ;
 ///     schema:name "Bar" ."#;
 ///
-/// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+/// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
 /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
 /// let mut count = 0;
 /// for triple in N3Parser::new().for_slice(file) {
@@ -731,7 +760,7 @@ impl Iterator for SliceN3Parser<'_> {
 ///     b" a schema:Person ; schema:name \"Bar\" .",
 /// ];
 ///
-/// let rdf_type = N3Term::NamedNode(rdf::TYPE.into_owned());
+/// let rdf_type = N3Term::NamedNode(rdf::TYPE.to_owned());
 /// let schema_person = N3Term::NamedNode(NamedNode::new("http://schema.org/Person")?);
 /// let mut count = 0;
 /// let mut parser = N3Parser::new().low_level();
@@ -860,7 +889,7 @@ struct N3Recognizer {
 
 struct N3RecognizerContext {
     lexer_options: N3LexerOptions,
-    prefixes: HashMap<String, Iri<String>>,
+    prefixes: HashMap<OxString, Iri<OxString>>,
 }
 
 impl RuleRecognizer for N3Recognizer {
@@ -945,7 +974,7 @@ impl RuleRecognizer for N3Recognizer {
                 },
                 N3State::PrefixExpectPrefix => return match token {
                     N3Token::PrefixedName { prefix, local, .. } if local.is_empty() => {
-                        self.stack.push(N3State::PrefixExpectIri { name: prefix.to_owned() });
+                        self.stack.push(N3State::PrefixExpectIri { name: OxString::new_owned(prefix) });
                         self
                     }
                     _ => {
@@ -1126,7 +1155,7 @@ impl RuleRecognizer for N3Recognizer {
                             Err(e) => self.error(errors, e)
                         }
                         N3Token::BlankNodeLabel(bnode) => {
-                            self.terms.push(BlankNode::new_unchecked(bnode).into());
+                            self.terms.push(BlankNode::new_unchecked(OxString::new_owned(bnode)).into());
                             self
                         }
                         N3Token::Variable(name) => {
@@ -1146,15 +1175,15 @@ impl RuleRecognizer for N3Recognizer {
                             self
                         }
                         N3Token::Integer(v) => {
-                            self.terms.push(Literal::new_typed_literal(v, xsd::INTEGER).into());
+                            self.terms.push(Literal::new_typed_literal(OxString::new_owned(v), xsd::INTEGER).into());
                             self
                         }
                         N3Token::Decimal(v) => {
-                            self.terms.push(Literal::new_typed_literal(v, xsd::DECIMAL).into());
+                            self.terms.push(Literal::new_typed_literal(OxString::new_owned(v), xsd::DECIMAL).into());
                             self
                         }
                         N3Token::Double(v) => {
-                            self.terms.push(Literal::new_typed_literal(v, xsd::DOUBLE).into());
+                            self.terms.push(Literal::new_typed_literal(OxString::new_owned(v), xsd::DOUBLE).into());
                             self
                         }
                         N3Token::PlainKeyword("true") => {
@@ -1259,7 +1288,7 @@ impl RuleRecognizer for N3Recognizer {
                             if direction.is_some() {
                                 return self.error(errors, "rdf:dirLangString is not supported in N3");
                             }
-                            self.terms.push(Literal::new_language_tagged_literal_unchecked(value, language.to_ascii_lowercase()).into());
+                            self.terms.push(Literal::new_language_tagged_literal_unchecked(value, to_lowercase(language)).into());
                             return self;
                         }
                         N3Token::Punctuation("^^") => {
@@ -1382,8 +1411,9 @@ impl N3Recognizer {
         data: B,
         is_ending: bool,
         unchecked: bool,
-        base_iri: Option<Iri<String>>,
-        prefixes: HashMap<String, Iri<String>>,
+        base_iri: Option<Iri<OxString>>,
+        prefixes: HashMap<OxString, Iri<OxString>>,
+        max_buffer_size: usize,
     ) -> Parser<B, Self> {
         Parser::new(
             Lexer::new(
@@ -1391,7 +1421,7 @@ impl N3Recognizer {
                 data,
                 is_ending,
                 MIN_BUFFER_SIZE,
-                MAX_BUFFER_SIZE,
+                max_buffer_size,
                 Some(b"#"),
             ),
             Self {
@@ -1442,7 +1472,7 @@ enum N3State {
     N3DocExpectDot,
     BaseExpectIri,
     PrefixExpectPrefix,
-    PrefixExpectIri { name: String },
+    PrefixExpectIri { name: OxString },
     Triples,
     TriplesMiddle,
     TriplesEnd,
@@ -1464,8 +1494,8 @@ enum N3State {
     IriPropertyList,
     CollectionBeginning,
     CollectionPossibleEnd,
-    LiteralPossibleSuffix { value: String },
-    LiteralExpectDatatype { value: String },
+    LiteralPossibleSuffix { value: OxString },
+    LiteralExpectDatatype { value: OxString },
     FormulaContent,
     FormulaContentExpectDot,
 }
@@ -1474,7 +1504,7 @@ enum N3State {
 ///
 /// See [`LowLevelN3Parser::prefixes`].
 pub struct N3PrefixesIter<'a> {
-    inner: Iter<'a, String, Iri<String>>,
+    inner: Iter<'a, OxString, Iri<OxString>>,
 }
 
 impl<'a> Iterator for N3PrefixesIter<'a> {
