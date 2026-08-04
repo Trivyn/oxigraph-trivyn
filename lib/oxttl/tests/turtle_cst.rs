@@ -15,8 +15,8 @@
 )]
 
 use oxrdf::{Literal, NamedNode, Term};
-use oxttl::TurtleCstParser;
 use oxttl::turtle_cst::Statement;
+use oxttl::{TurtleCstParser, TurtleParser};
 
 const ONT: &str = include_str!("turtle_cst_fixtures/commented_ontology.ttl");
 
@@ -24,6 +24,10 @@ fn parse(input: &str) -> oxttl::TurtleCst {
     TurtleCstParser::new()
         .parse_slice(input.as_bytes())
         .unwrap_or_else(|e| panic!("parse failed: {e}"))
+}
+
+fn normalize_line_endings(input: &str) -> String {
+    input.replace("\r\n", "\n")
 }
 
 #[test]
@@ -41,7 +45,7 @@ fn rename_class_preserves_comments_and_layout() {
     let n = cst.rename_iri(&old, &new);
     // Mammal appears: as subject (1), as object of rdfs:subClassOf in Dog (1) — total 2.
     assert_eq!(n, 2, "expected to rename 2 occurrences of ex:Mammal");
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     assert!(!out.contains("ex:Mammal"));
     assert!(out.contains("ex:Tetrapod"));
     // Surrounding comments are intact.
@@ -65,7 +69,7 @@ fn swap_parent_class() {
     for s in stmts {
         assert!(s.replace_object(&sub_class_of, &mammal, animal.clone()));
     }
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     assert!(out.contains("ex:Dog a owl:Class ;\n    rdfs:subClassOf ex:Animal ;"));
     // Sibling class definitions and comments are unchanged.
     assert!(out.contains("# Mammals are a subclass of Animal."));
@@ -118,7 +122,7 @@ fn remove_parent_class() {
     for s in stmts {
         assert!(s.remove_predicate_object(&sub_class_of, &mammal));
     }
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     // Dog no longer subclasses Mammal.
     let dog_section = out
         .split("ex:Dog a owl:Class")
@@ -133,14 +137,11 @@ fn remove_parent_class() {
 fn add_class_appends_statement() {
     let mut cst = parse(ONT);
     let cat_iri = NamedNode::new_unchecked("http://example.com/ont#Cat");
-    let rdf_type =
-        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-    let owl_class: Term =
-        NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Class").into();
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let owl_class: Term = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Class").into();
     let sub_class_of = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#subClassOf");
     let mammal: Term = NamedNode::new_unchecked("http://example.com/ont#Mammal").into();
-    let label_iri =
-        NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
+    let label_iri = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
     let label_obj: Term = Literal::new_simple_literal("Cat").into();
 
     let s = cst.add_statement(cat_iri.clone().into());
@@ -165,7 +166,7 @@ fn remove_class_removes_subject_section_only() {
     let dog = NamedNode::new_unchecked("http://example.com/ont#Dog");
     let n = cst.remove_statements_for_subject(&dog);
     assert_eq!(n, 1);
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     // Dog's own section is gone.
     assert!(!out.contains("ex:Dog a owl:Class"));
     assert!(!out.contains("rdfs:label \"Dog\""));
@@ -204,7 +205,6 @@ fn add_predicate_object_to_empty_pog_omits_leading_separator() {
         "no stray ';' immediately after subject:\n{out}"
     );
     // And the result must re-parse cleanly via the regular Turtle parser.
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }
@@ -238,7 +238,6 @@ fn add_predicate_object_preserves_multi_line_indent() {
         "added POG must inherit the statement's indent (`;\\n      ex:p2`):\n{out}"
     );
     // Previous POGs must still parse cleanly via the regular parser.
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }
@@ -268,7 +267,6 @@ fn remove_first_pog_clears_separator_on_promoted_pog() {
         !out.contains("ex:A ;") && !out.contains("ex:A;"),
         "promoted POG must not carry leading ';':\n{out}"
     );
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }

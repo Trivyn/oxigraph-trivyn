@@ -20,15 +20,17 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     clippy::must_use_candidate,
-    clippy::items_after_statements
+    clippy::items_after_statements,
+    clippy::expect_used,
+    clippy::panic
 )]
 
 use crate::lexer::{N3Lexer, N3LexerMode, N3LexerOptions, N3Token};
 use crate::toolkit::{Lexer, TextPosition, TokenOrLineJump, TurtleSyntaxError};
-use crate::{MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
-use oxiri::{Iri, IriParseError};
+use crate::{DEFAULT_MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
+use oxiri::{Iri, IriParseError, IriRef};
 use oxrdf::vocab::{rdf, xsd};
-use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, OxString, Term};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -425,7 +427,7 @@ fn lex_to_events(
         input,
         true, // is_ending — we have the entire slice
         MIN_BUFFER_SIZE,
-        MAX_BUFFER_SIZE,
+        DEFAULT_MAX_BUFFER_SIZE,
         Some(b"#"),
         true, // emit_trivia
     );
@@ -434,7 +436,8 @@ fn lex_to_events(
     // and, in strict mode, rejects every relative IRI ("No scheme found in an
     // absolute IRI") before the parser's own resolution can run.
     let options = N3LexerOptions {
-        base_iri: base_iri.cloned(),
+        base_iri: base_iri
+            .map(|base_iri| Iri::parse_unchecked(OxString::new_owned(base_iri.as_str()))),
     };
     let mut events = Vec::new();
     enum Tag {
@@ -443,15 +446,19 @@ fn lex_to_events(
         LineJump,
         Comment,
     }
-    while let Some(result) = lexer.parse_next(&options) {
-        let event = result?;
-        // Capture the owned token kind first so we can drop the borrow before
-        // calling other methods on the lexer.
-        let tag = match event {
-            TokenOrLineJump::Token(t) => Tag::Token(token_kind_from(&t)),
-            TokenOrLineJump::Whitespace => Tag::Whitespace,
-            TokenOrLineJump::LineJump => Tag::LineJump,
-            TokenOrLineJump::Comment => Tag::Comment,
+    loop {
+        // Capture the owned token kind in a nested scope so the token borrow is
+        // dropped before calling other methods on the lexer.
+        let tag = {
+            let Some(result) = lexer.parse_next(&options) else {
+                break;
+            };
+            match result? {
+                TokenOrLineJump::Token(t) => Tag::Token(token_kind_from(&t)),
+                TokenOrLineJump::Whitespace => Tag::Whitespace,
+                TokenOrLineJump::LineJump => Tag::LineJump,
+                TokenOrLineJump::Comment => Tag::Comment,
+            }
         };
         let source = lexer.last_token_source().to_string();
         let location = lexer.last_token_location();
@@ -471,7 +478,7 @@ fn lex_to_events(
 
 fn token_kind_from(token: &N3Token<'_>) -> OwnedTokenKind {
     match token {
-        N3Token::IriRef(value) => OwnedTokenKind::IriRef(value.clone()),
+        N3Token::IriRef(value) => OwnedTokenKind::IriRef(value.to_string()),
         N3Token::PrefixedName { prefix, local, .. } => OwnedTokenKind::PrefixedName {
             prefix: (*prefix).to_owned(),
             local: local.to_string(),
@@ -482,8 +489,8 @@ fn token_kind_from(token: &N3Token<'_>) -> OwnedTokenKind {
             OwnedTokenKind::Punctuation(String::new())
         }
         N3Token::BlankNodeLabel(label) => OwnedTokenKind::BlankNodeLabel((*label).to_owned()),
-        N3Token::String(s) => OwnedTokenKind::String(s.clone()),
-        N3Token::LongString(s) => OwnedTokenKind::LongString(s.clone()),
+        N3Token::String(s) => OwnedTokenKind::String(s.to_string()),
+        N3Token::LongString(s) => OwnedTokenKind::LongString(s.to_string()),
         N3Token::Integer(_) => OwnedTokenKind::Integer,
         N3Token::Decimal(_) => OwnedTokenKind::Decimal,
         N3Token::Double(_) => OwnedTokenKind::Double,
@@ -1337,7 +1344,7 @@ fn parse_term_from_token(
             parse_string_literal(cursor, token, prefixes, base, lenient)?,
         )),
         OwnedTokenKind::Integer => {
-            let value = Literal::new_typed_literal(token.source.as_str(), xsd::INTEGER);
+            let value = Literal::new_typed_literal(token.source.clone(), xsd::INTEGER);
             Ok(TermNode::Literal(LiteralNode {
                 quoted: SourceText::new(token.source.clone()),
                 kind: LiteralKind::Plain,
@@ -1347,7 +1354,7 @@ fn parse_term_from_token(
             }))
         }
         OwnedTokenKind::Decimal => {
-            let value = Literal::new_typed_literal(token.source.as_str(), xsd::DECIMAL);
+            let value = Literal::new_typed_literal(token.source.clone(), xsd::DECIMAL);
             Ok(TermNode::Literal(LiteralNode {
                 quoted: SourceText::new(token.source.clone()),
                 kind: LiteralKind::Plain,
@@ -1357,7 +1364,7 @@ fn parse_term_from_token(
             }))
         }
         OwnedTokenKind::Double => {
-            let value = Literal::new_typed_literal(token.source.as_str(), xsd::DOUBLE);
+            let value = Literal::new_typed_literal(token.source.clone(), xsd::DOUBLE);
             Ok(TermNode::Literal(LiteralNode {
                 quoted: SourceText::new(token.source.clone()),
                 kind: LiteralKind::Plain,
@@ -1369,7 +1376,7 @@ fn parse_term_from_token(
         OwnedTokenKind::Keyword(k) => {
             let lower = k.to_ascii_lowercase();
             if lower == "true" || lower == "false" {
-                let value = Literal::new_typed_literal(lower.as_str(), xsd::BOOLEAN);
+                let value = Literal::new_typed_literal(lower, xsd::BOOLEAN);
                 Ok(TermNode::Literal(LiteralNode {
                     quoted: SourceText::new(token.source.clone()),
                     kind: LiteralKind::Plain,
@@ -1436,8 +1443,7 @@ fn parse_string_literal(
                         let caret_source = t.source.clone();
                         let (leading_iri_trivia, iri_token) = cursor.take_token()?;
                         let iri_node = iri_node_from_token(&iri_token, prefixes, base, lenient)?;
-                        let value =
-                            Literal::new_typed_literal(raw.as_str(), iri_node.value.clone());
+                        let value = Literal::new_typed_literal(raw.clone(), iri_node.value.clone());
                         return Ok(LiteralNode {
                             quoted: SourceText::new(token.source),
                             kind,
@@ -1457,7 +1463,7 @@ fn parse_string_literal(
         }
     }
     // No suffix.
-    let value = Literal::new_simple_literal(raw.as_str());
+    let value = Literal::new_simple_literal(raw);
     Ok(LiteralNode {
         quoted: SourceText::new(token.source),
         kind,
@@ -1730,7 +1736,12 @@ fn iri_node_from_iriref(
 }
 
 fn resolve_iri(value: &str, base: Option<&Iri<String>>) -> Option<String> {
-    Some(base?.resolve(value).ok()?.into_inner())
+    Some(
+        base?
+            .resolve(&IriRef::parse(value).ok()?)
+            .ok()?
+            .into_inner(),
+    )
 }
 
 // =====================================================================
@@ -2475,14 +2486,14 @@ fn object_node_from_term(t: &Term) -> ObjectNode {
                     leading_trivia: Vec::new(),
                     tag: SourceText::new(format!("@{lang}")),
                 })
-            } else if value.datatype() != xsd::STRING {
+            } else if value.datatype() != &xsd::STRING {
                 Some(LiteralSuffix::Datatype {
                     leading_trivia: Vec::new(),
                     caret: SourceText::new("^^"),
                     leading_iri_trivia: Vec::new(),
                     iri: IriNode {
                         source: String::new(),
-                        value: value.datatype().into_owned(),
+                        value: value.datatype().clone(),
                         dirty: true,
                     },
                 })

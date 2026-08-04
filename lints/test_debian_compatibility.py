@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -10,6 +11,7 @@ ALLOWED_MISSING_PACKAGES = {
     "codspeed-criterion-compat",
     "oxhttp",
     "geo",
+    "oxiri",
     "wkt",
     "quick-xml",
     "getrandom",
@@ -122,4 +124,4 @@ for package_id in cargo_metadata["workspace_default_members"]:
 for error in sorted(errors):
     print(error)
 if errors:
-    exit(1)
+    sys.exit(1)

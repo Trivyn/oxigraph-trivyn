@@ -3,21 +3,22 @@
 use oxrdf::OxString;
 use oxrdf::vocab::xsd;
 use rand::random;
+pub use spargebra::algebra::PropertyPathExpression;
 use spargebra::algebra::{
-    AggregateExpression as AlAggregateExpression, AggregateFunction, Expression as AlExpression,
+    AggregateExpression as AlAggregateExpression, Expression as AlExpression,
     GraphPattern as AlGraphPattern, OrderExpression as AlOrderExpression,
 };
-pub use spargebra::algebra::{Function, PropertyPathExpression};
 use spargebra::term::{BlankNode, TermPattern, TriplePattern};
 pub use spargebra::term::{
     GroundTerm, GroundTermPattern, Literal, NamedNode, NamedNodePattern, Variable,
 };
 #[cfg(feature = "sparql-12")]
 use spargebra::term::{GroundTriple, GroundTriplePattern};
+use spargebra::vocab::sparql;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Sub};
+use std::ops::{BitAnd, BitOr, Not};
 
 /// An [expression](https://www.w3.org/TR/sparql11-query/#expressions).
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -29,30 +30,6 @@ pub enum Expression {
     Or(Vec<Self>),
     /// [Logical-and](https://www.w3.org/TR/sparql11-query/#func-logical-and).
     And(Vec<Self>),
-    /// [RDFterm-equal](https://www.w3.org/TR/sparql11-query/#func-RDFterm-equal) and all the XSD equalities.
-    Equal(Box<Self>, Box<Self>),
-    /// [sameTerm](https://www.w3.org/TR/sparql11-query/#func-sameTerm).
-    SameTerm(Box<Self>, Box<Self>),
-    /// [op:numeric-greater-than](https://www.w3.org/TR/xpath-functions-31/#func-numeric-greater-than) and other XSD greater than operators.
-    Greater(Box<Self>, Box<Self>),
-    GreaterOrEqual(Box<Self>, Box<Self>),
-    /// [op:numeric-less-than](https://www.w3.org/TR/xpath-functions-31/#func-numeric-less-than) and other XSD greater than operators.
-    Less(Box<Self>, Box<Self>),
-    LessOrEqual(Box<Self>, Box<Self>),
-    /// [op:numeric-add](https://www.w3.org/TR/xpath-functions-31/#func-numeric-add) and other XSD additions.
-    Add(Box<Self>, Box<Self>),
-    /// [op:numeric-subtract](https://www.w3.org/TR/xpath-functions-31/#func-numeric-subtract) and other XSD subtractions.
-    Subtract(Box<Self>, Box<Self>),
-    /// [op:numeric-multiply](https://www.w3.org/TR/xpath-functions-31/#func-numeric-multiply) and other XSD multiplications.
-    Multiply(Box<Self>, Box<Self>),
-    /// [op:numeric-divide](https://www.w3.org/TR/xpath-functions-31/#func-numeric-divide) and other XSD divides.
-    Divide(Box<Self>, Box<Self>),
-    /// [op:numeric-unary-plus](https://www.w3.org/TR/xpath-functions-31/#func-numeric-unary-plus) and other XSD unary plus.
-    UnaryPlus(Box<Self>),
-    /// [op:numeric-unary-minus](https://www.w3.org/TR/xpath-functions-31/#func-numeric-unary-minus) and other XSD unary minus.
-    UnaryMinus(Box<Self>),
-    /// [fn:not](https://www.w3.org/TR/xpath-functions-31/#func-not).
-    Not(Box<Self>),
     /// [EXISTS](https://www.w3.org/TR/sparql11-query/#func-filter-exists).
     Exists(Box<GraphPattern>),
     /// [BOUND](https://www.w3.org/TR/sparql11-query/#func-bound).
@@ -62,7 +39,7 @@ pub enum Expression {
     /// [COALESCE](https://www.w3.org/TR/sparql11-query/#func-coalesce).
     Coalesce(Vec<Self>),
     /// A regular function call.
-    FunctionCall(Function, Vec<Self>),
+    FunctionCall(NamedNode, Vec<Self>),
 }
 
 impl Expression {
@@ -130,7 +107,18 @@ impl Expression {
             (Self::Literal(left), Self::Literal(right)) if left == right => true.into(),
             (left, right) => {
                 let (left, right) = order_pair(left, right);
-                Self::Equal(Box::new(left), Box::new(right))
+                Self::FunctionCall(sparql::EQUALS, vec![left, right])
+            }
+        }
+    }
+
+    pub fn not_equal(left: Self, right: Self) -> Self {
+        match (left, right) {
+            (Self::NamedNode(left), Self::NamedNode(right)) => (left != right).into(),
+            (Self::Literal(left), Self::Literal(right)) if left != right => true.into(),
+            (left, right) => {
+                let (left, right) = order_pair(left, right);
+                Self::FunctionCall(sparql::NOT_EQUALS, vec![left, right])
             }
         }
     }
@@ -141,29 +129,9 @@ impl Expression {
             (Self::Literal(left), Self::Literal(right)) if left == right => true.into(),
             (left, right) => {
                 let (left, right) = order_pair(left, right);
-                Self::SameTerm(Box::new(left), Box::new(right))
+                Self::FunctionCall(sparql::SAME_TERM, vec![left, right])
             }
         }
-    }
-
-    pub fn greater(left: Self, right: Self) -> Self {
-        Self::Greater(Box::new(left), Box::new(right))
-    }
-
-    pub fn greater_or_equal(left: Self, right: Self) -> Self {
-        Self::GreaterOrEqual(Box::new(left), Box::new(right))
-    }
-
-    pub fn less(left: Self, right: Self) -> Self {
-        Self::Less(Box::new(left), Box::new(right))
-    }
-
-    pub fn less_or_equal(left: Self, right: Self) -> Self {
-        Self::LessOrEqual(Box::new(left), Box::new(right))
-    }
-
-    pub fn unary_plus(inner: Self) -> Self {
-        Self::UnaryPlus(Box::new(inner))
     }
 
     pub fn exists(inner: GraphPattern) -> Self {
@@ -188,7 +156,7 @@ impl Expression {
         Self::Coalesce(args)
     }
 
-    pub fn call(name: Function, args: Vec<Self>) -> Self {
+    pub fn call(name: NamedNode, args: Vec<Self>) -> Self {
         Self::FunctionCall(name, args)
     }
 
@@ -231,22 +199,6 @@ impl Expression {
                     i.lookup_used_variables(callback);
                 }
             }
-            Self::Equal(a, b)
-            | Self::SameTerm(a, b)
-            | Self::Greater(a, b)
-            | Self::GreaterOrEqual(a, b)
-            | Self::Less(a, b)
-            | Self::LessOrEqual(a, b)
-            | Self::Add(a, b)
-            | Self::Subtract(a, b)
-            | Self::Multiply(a, b)
-            | Self::Divide(a, b) => {
-                a.lookup_used_variables(callback);
-                b.lookup_used_variables(callback);
-            }
-            Self::UnaryPlus(i) | Self::UnaryMinus(i) | Self::Not(i) => {
-                i.lookup_used_variables(callback)
-            }
             Self::Exists(e) => e.lookup_used_variables(callback),
             Self::If(a, b, c) => {
                 a.lookup_used_variables(callback);
@@ -269,74 +221,19 @@ impl Expression {
                 Self::from_sparql_algebra(left),
                 Self::from_sparql_algebra(right),
             ]),
-            AlExpression::Equal(left, right) => Self::Equal(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::SameTerm(left, right) => Self::SameTerm(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::Greater(left, right) => Self::Greater(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::GreaterOrEqual(left, right) => Self::GreaterOrEqual(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::Less(left, right) => Self::Less(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::LessOrEqual(left, right) => Self::LessOrEqual(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
             AlExpression::In(left, right) => {
                 let left = Self::from_sparql_algebra(left);
                 match right.len() {
                     0 => Self::if_cond(left, false.into(), false.into()),
-                    1 => Self::Equal(
-                        Box::new(left),
-                        Box::new(Self::from_sparql_algebra(&right[0])),
-                    ),
+                    1 => Self::equal(left, Self::from_sparql_algebra(&right[0])),
                     _ => Self::Or(
                         right
                             .iter()
-                            .map(|e| {
-                                Self::Equal(
-                                    Box::new(left.clone()),
-                                    Box::new(Self::from_sparql_algebra(e)),
-                                )
-                            })
+                            .map(|e| Self::equal(left.clone(), Self::from_sparql_algebra(e)))
                             .collect(),
                     ),
                 }
             }
-            AlExpression::Add(left, right) => Self::Add(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::Subtract(left, right) => Self::Subtract(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::Multiply(left, right) => Self::Multiply(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::Divide(left, right) => Self::Divide(
-                Box::new(Self::from_sparql_algebra(left)),
-                Box::new(Self::from_sparql_algebra(right)),
-            ),
-            AlExpression::UnaryPlus(inner) => {
-                Self::UnaryPlus(Box::new(Self::from_sparql_algebra(inner)))
-            }
-            AlExpression::UnaryMinus(inner) => {
-                Self::UnaryMinus(Box::new(Self::from_sparql_algebra(inner)))
-            }
-            AlExpression::Not(inner) => Self::Not(Box::new(Self::from_sparql_algebra(inner))),
             AlExpression::Exists(inner) => Self::Exists(Box::new(
                 GraphPattern::from_sparql_algebra(inner, &mut HashMap::new()),
             )),
@@ -358,23 +255,30 @@ impl Expression {
 
     fn returns_boolean(&self) -> bool {
         match self {
-            Self::Or(_)
-            | Self::And(_)
-            | Self::Equal(_, _)
-            | Self::SameTerm(_, _)
-            | Self::Greater(_, _)
-            | Self::GreaterOrEqual(_, _)
-            | Self::Less(_, _)
-            | Self::LessOrEqual(_, _)
-            | Self::Not(_)
-            | Self::Exists(_)
-            | Self::Bound(_)
-            | Self::FunctionCall(
-                Function::IsBlank | Function::IsIri | Function::IsLiteral | Function::IsNumeric,
-                _,
-            ) => true,
-            #[cfg(feature = "sparql-12")]
-            Self::FunctionCall(Function::IsTriple, _) => true,
+            Self::Or(_) | Self::And(_) | Self::Exists(_) | Self::Bound(_) => true,
+            Self::FunctionCall(name, _)
+                if [
+                    sparql::LOGICAL_NOT,
+                    sparql::EQUALS,
+                    sparql::NOT_EQUALS,
+                    sparql::SAME_TERM,
+                    sparql::GREATER_THAN,
+                    sparql::GREATER_THAN_OR_EQUAL,
+                    sparql::LESS_THAN,
+                    sparql::LESS_THAN_OR_EQUAL,
+                    sparql::IS_BLANK,
+                    sparql::IS_IRI,
+                    sparql::IS_URI,
+                    sparql::IS_LITERAL,
+                    sparql::IS_NUMERIC,
+                    #[cfg(feature = "sparql-12")]
+                    sparql::IS_TRIPLE,
+                    xsd::BOOLEAN,
+                ]
+                .contains(name) =>
+            {
+                true
+            }
             Self::Literal(literal) => *literal.datatype() == xsd::BOOLEAN,
             Self::If(_, a, b) => a.returns_boolean() && b.returns_boolean(),
             _ => false,
@@ -430,7 +334,7 @@ impl From<GroundTermPattern> for Expression {
 impl From<GroundTriple> for Expression {
     fn from(value: GroundTriple) -> Self {
         Self::FunctionCall(
-            Function::Triple,
+            sparql::TRIPLE,
             vec![
                 value.subject.into(),
                 value.predicate.into(),
@@ -444,7 +348,7 @@ impl From<GroundTriple> for Expression {
 impl From<GroundTriplePattern> for Expression {
     fn from(value: GroundTriplePattern) -> Self {
         Self::FunctionCall(
-            Function::Triple,
+            sparql::TRIPLE,
             vec![
                 value.subject.into(),
                 value.predicate.into(),
@@ -482,49 +386,6 @@ impl From<&Expression> for AlExpression {
                 .map(Into::into)
                 .reduce(|a, b| Self::And(Box::new(a), Box::new(b)))
                 .unwrap_or_else(|| Literal::from(true).into()),
-            Expression::Equal(left, right) => Self::Equal(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::SameTerm(left, right) => Self::SameTerm(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Greater(left, right) => Self::Greater(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::GreaterOrEqual(left, right) => Self::GreaterOrEqual(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Less(left, right) => Self::Less(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::LessOrEqual(left, right) => Self::LessOrEqual(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Add(left, right) => Self::Add(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Subtract(left, right) => Self::Subtract(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Multiply(left, right) => Self::Multiply(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::Divide(left, right) => Self::Divide(
-                Box::new(left.as_ref().into()),
-                Box::new(right.as_ref().into()),
-            ),
-            Expression::UnaryPlus(inner) => Self::UnaryPlus(Box::new(inner.as_ref().into())),
-            Expression::UnaryMinus(inner) => Self::UnaryMinus(Box::new(inner.as_ref().into())),
-            Expression::Not(inner) => Self::Not(Box::new(inner.as_ref().into())),
             Expression::Exists(inner) => Self::Exists(Box::new(inner.as_ref().into())),
             Expression::Bound(variable) => Self::Bound(variable.clone()),
             Expression::If(cond, yes, no) => Self::If(
@@ -561,58 +422,10 @@ impl Not for Expression {
 
     fn not(self) -> Self {
         if let Some(v) = self.effective_boolean_value() {
-            (!v).into()
-        } else if let Self::Not(v) = self {
-            if v.returns_boolean() {
-                *v
-            } else {
-                Self::Not(Box::new(Self::Not(v)))
-            }
-        } else {
-            Self::Not(Box::new(self))
+            return (!v).into();
         }
-    }
-}
-
-impl Add for Expression {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self {
-        let (left, right) = order_pair(self, rhs);
-        Self::Add(Box::new(left), Box::new(right))
-    }
-}
-
-impl Sub for Expression {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self {
-        Self::Subtract(Box::new(self), Box::new(rhs))
-    }
-}
-
-impl Mul for Expression {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self {
-        let (left, right) = order_pair(self, rhs);
-        Self::Multiply(Box::new(left), Box::new(right))
-    }
-}
-
-impl Div for Expression {
-    type Output = Self;
-
-    fn div(self, rhs: Self) -> Self {
-        Self::Divide(Box::new(self), Box::new(rhs))
-    }
-}
-
-impl Neg for Expression {
-    type Output = Self;
-
-    fn neg(self) -> Self {
-        Self::UnaryMinus(Box::new(self))
+        // TODO: collapse !! into EBV()
+        Self::FunctionCall(sparql::LOGICAL_NOT, vec![self])
     }
 }
 
@@ -1575,9 +1388,10 @@ pub enum AggregateExpression {
         distinct: bool,
     },
     FunctionCall {
-        name: AggregateFunction,
+        name: NamedNode,
         expr: Expression,
         distinct: bool,
+        scalarvals: BTreeMap<OxString, OxString>,
     },
 }
 
@@ -1591,10 +1405,12 @@ impl AggregateExpression {
                 name,
                 expr,
                 distinct,
+                scalarvals,
             } => Self::FunctionCall {
                 name: name.clone(),
                 expr: Expression::from_sparql_algebra(expr),
                 distinct: *distinct,
+                scalarvals: scalarvals.clone(),
             },
         }
     }
@@ -1610,10 +1426,12 @@ impl From<&AggregateExpression> for AlAggregateExpression {
                 name,
                 expr,
                 distinct,
+                scalarvals,
             } => Self::FunctionCall {
                 name: name.clone(),
                 expr: expr.into(),
                 distinct: *distinct,
+                scalarvals: scalarvals.clone(),
             },
         }
     }
