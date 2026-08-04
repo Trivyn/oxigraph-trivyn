@@ -21,12 +21,12 @@ pub enum QueryEvaluationError {
     /// Error if the dataset returns the default graph even if a named graph is expected
     #[error("The SPARQL dataset returned the default graph even if a named graph is expected")]
     UnexpectedDefaultGraph,
-    /// The given custom function is not supported
-    #[error("The custom function {0} is not supported")]
-    UnsupportedCustomFunction(NamedNode),
-    /// The given custom function arity is not supported
-    #[error("The custom function {name} requires between {} and {} arguments, but {actual} were given", .expected.start(), .expected.end())]
-    UnsupportedCustomFunctionArity {
+    /// The given function is not supported
+    #[error("The function {0} is not supported")]
+    UnsupportedFunction(NamedNode),
+    /// The given function arity is not supported
+    #[error("The function {name} requires between {} and {} arguments, but {actual} were given", .expected.start(), .expected.end())]
+    UnsupportedFunctionArity {
         name: NamedNode,
         expected: RangeInclusive<usize>,
         actual: usize,
@@ -71,14 +71,12 @@ impl From<ExpressionEvaluationError<Self>> for QueryEvaluationError {
     fn from(error: ExpressionEvaluationError<Self>) -> Self {
         match error {
             ExpressionEvaluationError::Context(e) => e,
-            ExpressionEvaluationError::UnsupportedCustomFunction(name) => {
-                Self::UnsupportedCustomFunction(name)
-            }
-            ExpressionEvaluationError::UnsupportedCustomFunctionArity {
+            ExpressionEvaluationError::UnsupportedFunction(name) => Self::UnsupportedFunction(name),
+            ExpressionEvaluationError::UnsupportedFunctionArity {
                 name,
                 expected,
                 actual,
-            } => Self::UnsupportedCustomFunctionArity {
+            } => Self::UnsupportedFunctionArity {
                 name,
                 expected,
                 actual,

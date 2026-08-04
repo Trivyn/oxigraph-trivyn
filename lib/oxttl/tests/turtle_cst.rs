@@ -15,8 +15,8 @@
 )]
 
 use oxrdf::{Literal, NamedNode, Term};
-use oxttl::TurtleCstParser;
 use oxttl::turtle_cst::Statement;
+use oxttl::{TurtleCstParser, TurtleParser};
 
 const ONT: &str = include_str!("turtle_cst_fixtures/commented_ontology.ttl");
 
@@ -133,14 +133,11 @@ fn remove_parent_class() {
 fn add_class_appends_statement() {
     let mut cst = parse(ONT);
     let cat_iri = NamedNode::new_unchecked("http://example.com/ont#Cat");
-    let rdf_type =
-        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-    let owl_class: Term =
-        NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Class").into();
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let owl_class: Term = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Class").into();
     let sub_class_of = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#subClassOf");
     let mammal: Term = NamedNode::new_unchecked("http://example.com/ont#Mammal").into();
-    let label_iri =
-        NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
+    let label_iri = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
     let label_obj: Term = Literal::new_simple_literal("Cat").into();
 
     let s = cst.add_statement(cat_iri.clone().into());
@@ -204,7 +201,6 @@ fn add_predicate_object_to_empty_pog_omits_leading_separator() {
         "no stray ';' immediately after subject:\n{out}"
     );
     // And the result must re-parse cleanly via the regular Turtle parser.
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }
@@ -238,7 +234,6 @@ fn add_predicate_object_preserves_multi_line_indent() {
         "added POG must inherit the statement's indent (`;\\n      ex:p2`):\n{out}"
     );
     // Previous POGs must still parse cleanly via the regular parser.
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }
@@ -268,7 +263,6 @@ fn remove_first_pog_clears_separator_on_promoted_pog() {
         !out.contains("ex:A ;") && !out.contains("ex:A;"),
         "promoted POG must not carry leading ';':\n{out}"
     );
-    use oxttl::TurtleParser;
     for r in TurtleParser::new().for_slice(out.as_bytes()) {
         r.unwrap_or_else(|e| panic!("output must re-parse: {e}\n--- out ---\n{out}"));
     }

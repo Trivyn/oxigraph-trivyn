@@ -1,7 +1,7 @@
 use crate::toolkit::{TokenRecognizer, TokenRecognizerError};
 use memchr::{memchr, memchr2};
 use oxilangtag::LanguageTag;
-use oxiri::Iri;
+use oxiri::{Iri, IriRef};
 #[cfg(feature = "rdf-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{NamedNode, OxStr, OxString};
@@ -185,6 +185,10 @@ impl TokenRecognizer for N3Lexer {
             _ => self.recognize_pname_or_keyword(data, is_ending),
         }
     }
+
+    fn token_contains_line_jumps(token: &N3Token<'_>) -> bool {
+        matches!(token, N3Token::LongString(_))
+    }
 }
 
 impl N3Lexer {
@@ -207,13 +211,28 @@ impl N3Lexer {
         let mut i = 1;
         loop {
             let end = memchr2(b'>', b'\\', &data[i..])?;
-            self.raw_buffer.extend_from_slice(&data[i..i + end]);
             i += end;
             match data[i] {
                 b'>' => {
-                    return Some((i + 1, self.parse_iri(0..i + 1, options)));
+                    let iri = if self.raw_buffer.is_empty() {
+                        &data[1..i]
+                    } else {
+                        self.raw_buffer.extend_from_slice(&data[i - end..i]);
+                        &self.raw_buffer
+                    };
+                    return Some((
+                        i + 1,
+                        Self::parse_iri(
+                            self.lenient,
+                            &mut self.string_buffer,
+                            iri,
+                            0..i + 1,
+                            options,
+                        ),
+                    ));
                 }
                 b'\\' => {
+                    self.raw_buffer.extend_from_slice(&data[i - end..i]);
                     let (additional, c) = self.recognize_escape(&data[i..], i, false)?;
                     i += additional + 1;
                     match c {
@@ -231,30 +250,43 @@ impl N3Lexer {
     }
 
     fn parse_iri(
-        &mut self,
+        lenient: bool,
+        string_buffer: &mut String,
+        iri: &[u8],
         position: Range<usize>,
         options: &N3LexerOptions,
     ) -> Result<N3Token<'static>, TokenRecognizerError> {
-        let iri = str_from_utf8(&self.raw_buffer, position.clone())?;
-        Ok(N3Token::IriRef(OxString::new_owned(
-            if let Some(base_iri) = options.base_iri.as_ref() {
-                self.string_buffer.clear();
-                if self.lenient {
-                    base_iri.resolve_into_unchecked(iri, &mut self.string_buffer)
-                } else {
-                    base_iri
-                        .resolve_into(iri, &mut self.string_buffer)
-                        .map_err(|e| (position, e.to_string()))?
-                }
-                &self.string_buffer
-            } else if self.lenient {
-                iri
+        let iri = str_from_utf8(iri, position.clone())?;
+        if lenient {
+            let Some(base_iri) = options.base_iri.as_ref() else {
+                return Ok(N3Token::IriRef(OxString::new_owned(iri)));
+            };
+            let iri = IriRef::parse_unchecked(iri);
+            Ok(N3Token::IriRef(OxString::new_owned(if iri.is_absolute() {
+                iri.into_inner()
             } else {
-                Iri::parse(iri)
-                    .map_err(|e| (position, e.to_string()))?
-                    .into_inner()
-            },
-        )))
+                string_buffer.clear();
+                base_iri.resolve_into_unchecked(&iri, string_buffer);
+                string_buffer
+            })))
+        } else {
+            let iri = IriRef::parse(iri).map_err(|e| (position.clone(), e.to_string()))?;
+            Ok(N3Token::IriRef(OxString::new_owned(if iri.is_absolute() {
+                iri.into_inner()
+            } else if let Some(base_iri) = options.base_iri.as_ref() {
+                string_buffer.clear();
+                base_iri
+                    .resolve_into(&iri, string_buffer)
+                    .map_err(|e| (position, e.to_string()))?;
+                string_buffer
+            } else {
+                return Err((
+                    position,
+                    format!("{iri} is a relative IRI even if no @base is set"),
+                )
+                    .into());
+            })))
+        }
     }
 
     fn recognize_pname_or_keyword<'a>(
