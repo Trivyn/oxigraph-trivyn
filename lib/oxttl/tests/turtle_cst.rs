@@ -26,6 +26,10 @@ fn parse(input: &str) -> oxttl::TurtleCst {
         .unwrap_or_else(|e| panic!("parse failed: {e}"))
 }
 
+fn normalize_line_endings(input: &str) -> String {
+    input.replace("\r\n", "\n")
+}
+
 #[test]
 fn round_trip_byte_exact() {
     let cst = parse(ONT);
@@ -41,7 +45,7 @@ fn rename_class_preserves_comments_and_layout() {
     let n = cst.rename_iri(&old, &new);
     // Mammal appears: as subject (1), as object of rdfs:subClassOf in Dog (1) — total 2.
     assert_eq!(n, 2, "expected to rename 2 occurrences of ex:Mammal");
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     assert!(!out.contains("ex:Mammal"));
     assert!(out.contains("ex:Tetrapod"));
     // Surrounding comments are intact.
@@ -65,7 +69,7 @@ fn swap_parent_class() {
     for s in stmts {
         assert!(s.replace_object(&sub_class_of, &mammal, animal.clone()));
     }
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     assert!(out.contains("ex:Dog a owl:Class ;\n    rdfs:subClassOf ex:Animal ;"));
     // Sibling class definitions and comments are unchanged.
     assert!(out.contains("# Mammals are a subclass of Animal."));
@@ -118,7 +122,7 @@ fn remove_parent_class() {
     for s in stmts {
         assert!(s.remove_predicate_object(&sub_class_of, &mammal));
     }
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     // Dog no longer subclasses Mammal.
     let dog_section = out
         .split("ex:Dog a owl:Class")
@@ -162,7 +166,7 @@ fn remove_class_removes_subject_section_only() {
     let dog = NamedNode::new_unchecked("http://example.com/ont#Dog");
     let n = cst.remove_statements_for_subject(&dog);
     assert_eq!(n, 1);
-    let out = cst.to_string();
+    let out = normalize_line_endings(&cst.to_string());
     // Dog's own section is gone.
     assert!(!out.contains("ex:Dog a owl:Class"));
     assert!(!out.contains("rdfs:label \"Dog\""));
