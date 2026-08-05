@@ -350,6 +350,20 @@ impl Store {
     /// Note that the transaction keeps the complete set of changes into memory, do not use them to load
     /// tens of millions of triples.
     ///
+    /// # Backend transaction contract
+    ///
+    /// Every storage backend guarantees one of two shapes, and callers may
+    /// rely on it: either **(a)** transactions are serialized against all
+    /// other transactions for their whole lifetime, or **(b)** `commit`
+    /// fails with a conflict error when a value the transaction read has
+    /// changed since it started. Both current backends (memory and RocksDB)
+    /// satisfy shape (a) via a transaction-lifetime lock, which makes
+    /// read-validate-write sequences (e.g. compare-and-swap on a pointer
+    /// value) serializable — not merely repeatable-read. A future
+    /// distributed backend may satisfy shape (b) instead; portable callers
+    /// should treat a conflict error at commit as "abort cleanly and retry
+    /// against fresh state".
+    ///
     /// Usage example:
     /// ```
     /// use oxigraph::model::*;

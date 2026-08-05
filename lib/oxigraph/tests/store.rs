@@ -457,6 +457,76 @@ fn test_backup() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The backend transaction contract (see `Store::start_transaction` docs):
+/// concurrent read-modify-write transactions must serialize (or
+/// conflict-fail at commit). Two threads each increment a counter quad;
+/// a lost update (final value 1) means a transaction read a snapshot that
+/// ignored a concurrent uncommitted transaction and overwrote its commit.
+fn transactions_serialize_read_modify_write(store: &Store) -> Result<(), Box<dyn Error>> {
+    let s = NamedNode::new("http://example.com/counter")?;
+    let p = NamedNode::new("http://example.com/value")?;
+    let subject = NamedOrBlankNode::from(s.clone());
+    store.insert(Quad::new(
+        s.clone(),
+        p.clone(),
+        Literal::new_simple_literal("0"),
+        GraphName::DefaultGraph,
+    ))?;
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let mut transaction = store.start_transaction().unwrap();
+                let current: Vec<Quad> = transaction
+                    .quads_for_pattern(Some(&subject), Some(&p), None, None)
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let [quad] = current.as_slice() else {
+                    panic!("exactly one counter quad, got {current:?}")
+                };
+                let Term::Literal(literal) = &quad.object else {
+                    panic!("counter must be a literal")
+                };
+                let value: u64 = literal.value().parse().unwrap();
+                // Widen the race window: without transaction-lifetime
+                // serialization both threads read the same value here.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                transaction.remove(quad);
+                transaction.insert(Quad::new(
+                    s.clone(),
+                    p.clone(),
+                    Literal::new_simple_literal((value + 1).to_string()),
+                    GraphName::DefaultGraph,
+                ));
+                transaction.commit().unwrap();
+            });
+        }
+    });
+    let final_quads: Vec<Quad> = store
+        .quads_for_pattern(Some(&subject), Some(&p), None, None)
+        .collect::<Result<_, _>>()?;
+    let [quad] = final_quads.as_slice() else {
+        panic!("exactly one counter quad after both commits, got {final_quads:?}")
+    };
+    assert_eq!(
+        quad.object,
+        Term::Literal(Literal::new_simple_literal("2")),
+        "both increments must survive — a value of 1 is a lost update"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_transactions_serialize_read_modify_write_in_memory() -> Result<(), Box<dyn Error>> {
+    transactions_serialize_read_modify_write(&Store::new()?)
+}
+
+#[test]
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+fn test_transactions_serialize_read_modify_write_on_disk() -> Result<(), Box<dyn Error>> {
+    let dir = TempDir::new()?;
+    transactions_serialize_read_modify_write(&Store::open(&dir)?)
+}
+
 #[test]
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 fn test_bad_backup() -> Result<(), Box<dyn Error>> {

@@ -17,6 +17,7 @@ use crate::storage::rocksdb_wrapper::{
     ColumnFamily, ColumnFamilyDefinition, Db, DbOptions, Iter, ReadableTransaction, Reader,
     Transaction,
 };
+use crate::storage::memory::{Lock, LockGuard};
 use crate::storage::{DEFAULT_BULK_LOAD_BATCH_SIZE, map_thread_result};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 #[cfg(feature = "rdf-12")]
@@ -80,6 +81,11 @@ pub struct RocksDbStorage {
     dpos_cf: ColumnFamily,
     dosp_cf: ColumnFamily,
     graphs_cf: ColumnFamily,
+    /// Serializes transactions for their whole lifetime, mirroring the
+    /// memory backend — see the backend transaction contract on
+    /// `Store::start_transaction`. Shared across clones (`Arc`), so one
+    /// storage = one transaction at a time, exactly like memory.
+    transaction_lock: Arc<Lock>,
 }
 
 impl RocksDbStorage {
@@ -187,6 +193,7 @@ impl RocksDbStorage {
             dpos_cf: db.column_family(DPOS_CF)?,
             dosp_cf: db.column_family(DOSP_CF)?,
             graphs_cf: db.column_family(GRAPHS_CF)?,
+            transaction_lock: Arc::new(Lock::new()),
             db,
         };
         this.migrate()?;
@@ -359,20 +366,31 @@ impl RocksDbStorage {
     }
 
     pub fn start_transaction(&self) -> Result<RocksDbStorageTransaction<'_>, StorageError> {
+        // Lock BEFORE creating the write batch, mirroring the memory
+        // backend: only one transaction runs at a time (the backend
+        // transaction contract's serialization shape).
+        let transaction_guard = self.transaction_lock.lock();
         Ok(RocksDbStorageTransaction {
             buffer: Vec::new(),
             transaction: self.db.start_transaction()?,
             storage: self,
+            _transaction_guard: transaction_guard,
         })
     }
 
     pub fn start_readable_transaction(
         &self,
     ) -> Result<RocksDbStorageReadableTransaction<'_>, StorageError> {
+        // Lock BEFORE taking the snapshot: with the lock held for the
+        // transaction's whole lifetime, the snapshot always includes every
+        // previously committed transaction, so read-validate-write
+        // sequences are serializable — not merely repeatable-read.
+        let transaction_guard = self.transaction_lock.lock();
         Ok(RocksDbStorageReadableTransaction {
             buffer: Vec::new(),
             transaction: self.db.start_readable_transaction()?,
             storage: self,
+            _transaction_guard: transaction_guard,
         })
     }
 
@@ -939,6 +957,7 @@ pub struct RocksDbStorageTransaction<'a> {
     buffer: Vec<u8>,
     transaction: Transaction,
     storage: &'a RocksDbStorage,
+    _transaction_guard: LockGuard<'a>,
 }
 
 impl RocksDbStorageTransaction<'_> {
@@ -1131,6 +1150,7 @@ pub struct RocksDbStorageReadableTransaction<'a> {
     buffer: Vec<u8>,
     transaction: ReadableTransaction<'a>,
     storage: &'a RocksDbStorage,
+    _transaction_guard: LockGuard<'a>,
 }
 
 impl RocksDbStorageReadableTransaction<'_> {
