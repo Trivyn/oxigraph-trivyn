@@ -1017,20 +1017,25 @@ fn pop_boxed_slice<T: Copy>(slice: &[T]) -> Box<[T]> {
     slice[..slice.len() - 1].into()
 }
 
-struct Lock {
+/// Transaction-lifetime lock shared by BOTH storage backends: acquiring it
+/// at transaction start and holding the guard until commit/abort is what
+/// makes the backend transaction contract's serialization shape true (see
+/// `Store::start_transaction`). The guard holds plain references (not a
+/// `MutexGuard`), so transactions stay `Send`.
+pub(super) struct Lock {
     mutex: Mutex<bool>,
     condvar: Condvar,
 }
 
 impl Lock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             mutex: Mutex::new(false),
             condvar: Condvar::new(),
         }
     }
 
-    fn lock(&self) -> LockGuard<'_> {
+    pub(super) fn lock(&self) -> LockGuard<'_> {
         *self
             .condvar
             .wait_while(self.mutex.lock().unwrap(), |v| *v)
@@ -1042,7 +1047,7 @@ impl Lock {
     }
 }
 
-struct LockGuard<'a> {
+pub(super) struct LockGuard<'a> {
     mutex: &'a Mutex<bool>,
     condvar: &'a Condvar,
 }
